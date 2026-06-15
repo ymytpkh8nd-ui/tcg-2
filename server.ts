@@ -3387,8 +3387,11 @@ async function tryOfflineMatch(filename: string): Promise<any | null> {
   if (
     lowerFile.includes("kamera_snapshot") || 
     lowerFile.includes("camera_snapshot") || 
+    lowerFile.includes("screenshot") ||
+    lowerFile.includes("screen shot") ||
     lowerFile.includes("blob") || 
     lowerFile.startsWith("image_") ||
+    lowerFile.startsWith("img_") ||
     lowerFile.startsWith("upload_")
   ) {
     return null;
@@ -3496,8 +3499,9 @@ async function tryOfflineMatch(filename: string): Promise<any | null> {
     }
   }
 
-  // 4. Last resort: Unique Name matching
-  if (nameWords.length > 0) {
+  // 4. Last resort: Unique Name matching only when the filename also contained
+  // a concrete number or set signal. A plain "meowth.jpg" is too ambiguous.
+  if (nameWords.length > 0 && (numberCandidates.length > 0 || Boolean(matchedSetCode))) {
     for (const nw of nameWords) {
       const searchPattern = `%${nw}%`;
       const match = await dbGet(
@@ -3518,9 +3522,45 @@ function normalizeScanText(value: any): string {
   return String(value || "")
     .replace(/[＿－ー–—]/g, "-")
     .replace(/[￥]/g, "¥")
+    .replace(/([0-9OoQ])\s*\/\s*([0-9OoQ])/g, "$1/$2")
+    .replace(/(?<=\d)[OoQ](?=\d|\/|\b)/g, "0")
+    .replace(/(^|[^0-9])([OoQ])(?=\d{2}\b)/g, (_match, prefix) => `${prefix}0`)
     .replace(/[­]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function normalizeOcrDigitText(value: string): string {
+  return normalizeScanText(value)
+    .replace(/[OoQ]/g, "0")
+    .replace(/[Il|](?=\d{2}\b)/g, "1");
+}
+
+function guessNamesFromScanText(value: string): string[] {
+  const stopWords = new Set([
+    "BASIC", "STAGE", "TRAINER", "ENERGY", "POKEMON", "POKÉMON", "HP", "WEAKNESS",
+    "RESISTANCE", "RETREAT", "FLIP", "COINS", "DAMAGE", "HEADS", "EACH", "ATTACK",
+    "FURY", "SWIPES", "ILLUS", "ILLUSTRATOR", "NINTENDO", "CREATURES", "GAME",
+    "FREAK", "CARD", "CARDS", "THIS", "FOR", "WHEN", "OBJECT", "LOCAL", "OCR"
+  ]);
+  const candidates: string[] = [];
+  const lines = String(value || "")
+    .split(/\n+/)
+    .map(line => line.replace(/[^A-Za-z0-9.'’ \-\u3040-\u30ff\u3400-\u9faf]/g, " ").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    if (/\.(jpe?g|png|webp|gif)\b/i.test(line) || /^[{\[]/.test(line)) continue;
+    if (!/[A-Za-z\u3040-\u30ff\u3400-\u9faf]/.test(line) || /\d{2,}/.test(line)) continue;
+    const upper = line.toUpperCase();
+    if ([...stopWords].some(word => upper === word || upper.startsWith(`${word} `))) continue;
+    const words = line.split(/\s+/).filter(w => w.length > 1 && !stopWords.has(w.toUpperCase()));
+    if (words.length === 0 || words.length > 4) continue;
+    const name = words.join(" ").trim();
+    if (name.length >= 3 && name.length <= 36) candidates.push(name);
+  }
+
+  return uniqueStrings(candidates).slice(0, 8);
 }
 
 function uniqueStrings(values: string[]): string[] {
@@ -3538,6 +3578,7 @@ function uniqueStrings(values: string[]): string[] {
 
 function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
   const joined = normalizeScanText([text, hints?.text, hints?.ocrText, hints?.filename].filter(Boolean).join(" "));
+  const digitSafeJoined = normalizeOcrDigitText(joined);
   const setCodes: string[] = [];
   const cardNumbers: string[] = [];
   const names: string[] = [];
@@ -3548,7 +3589,7 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
   const pokemonSetCodes = joined.match(/\b(?:SV-P|S-P|SM-P|SV|SM|S|XY|BW|DP|ADV|PCG)[ -]?\d{0,2}[A-Z]?\b/gi) || [];
   setCodes.push(...pokemonSetCodes.map(v => v.replace(/\s+/g, "").toUpperCase()));
 
-  const fractional = joined.match(/\b\d{1,3}\s*\/\s*\d{1,3}\b/g) || [];
+  const fractional = digitSafeJoined.match(/\b\d{1,3}\s*\/\s*\d{1,3}\b/g) || [];
   for (const num of fractional) {
     const clean = num.replace(/\s+/g, "");
     cardNumbers.push(clean);
@@ -3563,6 +3604,8 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
   if (hints?.set_code) setCodes.push(String(hints.set_code));
   if (Array.isArray(hints?.set_codes)) setCodes.push(...hints.set_codes.map(String));
   if (hints?.name) names.push(String(hints.name));
+  if (Array.isArray(hints?.names)) names.push(...hints.names.map(String));
+  names.push(...guessNamesFromScanText([text, hints?.text, hints?.ocrText].filter(Boolean).join("\n")));
 
   const priceCandidates: number[] = [];
   const priceRegexes = [
@@ -3582,16 +3625,18 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
   }
 
   const yellowLabelDetected = Boolean(hints?.yellow_label_detected) || /黄色|キズ|傷|訳あり|discount|damaged/i.test(joined);
-  const language = hints?.language || (/([ぁ-んァ-ン一-龯])/.test(joined) ? "JA" : "");
+  const hasJapanese = /([ぁ-んァ-ン一-龯])/.test(joined);
+  const hasLatinText = /[A-Za-z]{3,}/.test(joined);
+  const language = hints?.language || (hasJapanese ? "JA" : (hasLatinText ? "EN" : ""));
 
   return {
     text: joined,
     set_codes: uniqueStrings(setCodes),
     card_numbers: uniqueStrings(cardNumbers),
-    names: names.filter(Boolean),
+    names: uniqueStrings(names),
     yen_price: priceCandidates.length ? priceCandidates[0] : 0,
     yellow_label_detected: yellowLabelDetected,
-    language: String(language || (game === "onepiece" ? "JA" : "JA")).toUpperCase()
+    language: String(language || (game === "onepiece" ? "JA" : "EN")).toUpperCase()
   };
 }
 
@@ -3618,6 +3663,12 @@ async function findCardsByLocalHints(parsed: any, game = "pokemon"): Promise<any
   const setCodes = parsed.set_codes || [];
   const cardNumbers = parsed.card_numbers || [];
   const lang = (parsed.language || "JA").toUpperCase();
+  const ignoredWords = new Set(["BASIC", "STAGE", "TRAINER", "ENERGY", "POKEMON", "POKÉMON", "CARD", "CARDS", "LOCAL", "OCR", "FULL", "SOURCE", "BOTTOM", "NUMBER", "PRICE", "LOWER", "THIRD"]);
+  const textWords = normalizeScanText(parsed.text || "")
+    .split(/[^A-Za-z0-9ぁ-んァ-ン一-龯]+/)
+    .filter(w => w.length >= 3 && !/^\d+$/.test(w) && !ignoredWords.has(w.toUpperCase()))
+    .slice(0, 18);
+  const searchNames = uniqueStrings([...(parsed.names || []), ...textWords]).slice(0, 14);
 
   const addRows = (rows: any[]) => {
     for (const row of rows || []) {
@@ -3628,6 +3679,35 @@ async function findCardsByLocalHints(parsed: any, game = "pokemon"): Promise<any
       }
     }
   };
+
+  // Strongest signal for real card photos: printed name plus collector number.
+  // This still works when glare, sleeves, or price labels hide the set code.
+  for (const num of cardNumbers) {
+    const numClean = String(num).replace(/\s+/g, "").toUpperCase();
+    for (const name of searchNames) {
+      const pattern = `%${String(name).toLowerCase()}%`;
+      const rows = await dbAll(`
+        SELECT * FROM cards
+        WHERE game = ?
+          AND (UPPER(card_number) = ? OR UPPER(card_number) LIKE ? OR UPPER(card_number) LIKE ? OR UPPER(card_number) LIKE ?)
+          AND (
+            LOWER(pokemon_name) LIKE ?
+            OR LOWER(english_name) LIKE ?
+            OR LOWER(local_name) LIKE ?
+            OR LOWER(japanese_name) LIKE ?
+          )
+        ORDER BY
+          (CASE WHEN UPPER(language) = ? THEN 0 ELSE 1 END),
+          (CASE WHEN LOWER(english_name) = LOWER(?) OR LOWER(local_name) = LOWER(?) OR LOWER(pokemon_name) = LOWER(?) THEN 0 ELSE 1 END),
+          id ASC
+        LIMIT 6
+      `, [game, numClean, `${numClean}/%`, `%/${numClean}`, `%${numClean}`, pattern, pattern, pattern, pattern, lang, String(name), String(name), String(name)]);
+      addRows(rows);
+    }
+  }
+  if (results.length > 0 && cardNumbers.length > 0 && searchNames.length > 0) {
+    return results.slice(0, 8);
+  }
 
   for (const setCode of setCodes) {
     for (const num of cardNumbers) {
@@ -3658,11 +3738,7 @@ async function findCardsByLocalHints(parsed: any, game = "pokemon"): Promise<any
     addRows(rows);
   }
 
-  const textWords = normalizeScanText(parsed.text || "")
-    .split(/[^A-Za-z0-9ぁ-んァ-ン一-龯]+/)
-    .filter(w => w.length >= 3 && !/^\d+$/.test(w))
-    .slice(0, 12);
-  for (const name of [...(parsed.names || []), ...textWords]) {
+  for (const name of searchNames) {
     const pattern = `%${String(name).toLowerCase()}%`;
     const rows = await dbAll(`
       SELECT * FROM cards
@@ -3710,7 +3786,12 @@ app.post("/api/cards/scan", async (req, res) => {
     for (const row of localMatches) {
       const key = `${row.api_card_id || row.id}-${row.language}`;
       if (!matchedCards.some(c => `${c.api_card_id || c.id}-${c.language}` === key)) {
-        const confidence = parsed.card_numbers?.length ? (parsed.set_codes?.length ? 0.94 : 0.84) : 0.62;
+        const confidence = parsed.card_numbers?.length
+          ? (parsed.set_codes?.length ? 0.94 : (parsed.names?.length ? 0.9 : 0.84))
+          : 0.62;
+        const sourceLabel = parsed.set_codes?.length && parsed.card_numbers?.length
+          ? "Lokaler OCR-Fastmatch: Set + Nummer"
+          : (parsed.names?.length && parsed.card_numbers?.length ? "Lokaler OCR-Fastmatch: Name + Nummer" : "Lokaler OCR/DB-Kandidatenmatch");
         matchedCards.push({
           ...row,
           yen_price: parsed.yen_price || null,
@@ -3720,10 +3801,10 @@ app.post("/api/cards/scan", async (req, res) => {
           ai_detected_language: row.language || parsed.language,
           similarity_score: Math.round(confidence * 100),
           hash_match_score: Math.round(confidence * 100),
-          verification_status: parsed.set_codes?.length && parsed.card_numbers?.length ? "Lokaler OCR-Fastmatch: Set + Nummer" : "Lokaler OCR/DB-Kandidatenmatch",
+          verification_status: sourceLabel,
           scanner_source: "local_ocr"
         });
-        identifications.push(buildScanIdentification(row, parsed, parsed.set_codes?.length && parsed.card_numbers?.length ? "Lokaler OCR-Fastmatch: Set + Nummer" : "Lokaler OCR/DB-Kandidatenmatch", confidence));
+        identifications.push(buildScanIdentification(row, parsed, sourceLabel, confidence));
       }
     }
 

@@ -2091,12 +2091,52 @@ export default function App() {
     });
   };
 
+  const normalizeOcrForParsing = (value: string) => {
+    return String(value || "")
+      .replace(/[＿－ー–—]/g, "-")
+      .replace(/[￥]/g, "¥")
+      .replace(/(\d)\s*[Il|]\s*(\d)/g, "$1/1$2")
+      .replace(/([0-9OoQ])\s*\/\s*([0-9OoQ])/g, "$1/$2")
+      .replace(/(?<=\d)[OoQ](?=\d|\/|\b)/g, "0")
+      .replace(/(^|[^0-9])([OoQ])(?=\d{2}\b)/g, (_match, prefix) => `${prefix}0`)
+      .replace(/\s+/g, " ")
+      .trim();
+  };
+
+  const guessCardNamesFromOcr = (text: string) => {
+    const stopWords = new Set([
+      "BASIC", "STAGE", "TRAINER", "ENERGY", "POKEMON", "POKÉMON", "HP", "WEAKNESS",
+      "RESISTANCE", "RETREAT", "FLIP", "COINS", "DAMAGE", "HEADS", "EACH", "ATTACK",
+      "FURY", "SWIPES", "ILLUS", "ILLUSTRATOR", "NINTENDO", "CREATURES", "GAME",
+      "FREAK", "CARD", "CARDS", "THIS", "FOR", "WHEN", "OBJECT"
+    ]);
+    const lines = String(text || "")
+      .split(/\n+/)
+      .map(line => line.replace(/[^\p{L}\p{N}.'’ -]/gu, " ").replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    const candidates: string[] = [];
+    for (const line of lines) {
+      const compact = line.trim();
+      if (/\.(jpe?g|png|webp|gif)\b/i.test(compact) || /^[{\[]/.test(compact)) continue;
+      if (!/[A-Za-z]/.test(compact) || /\d{2,}/.test(compact)) continue;
+      const upper = compact.toUpperCase();
+      if ([...stopWords].some(word => upper === word || upper.startsWith(`${word} `))) continue;
+      const words = compact.split(/\s+/).filter(w => w.length > 1);
+      if (words.length > 4) continue;
+      const meaningful = words.filter(w => !stopWords.has(w.toUpperCase()));
+      const name = meaningful.join(" ").trim();
+      if (name.length >= 3 && name.length <= 32) candidates.push(name);
+    }
+    return Array.from(new Set(candidates)).slice(0, 6);
+  };
+
   const parseClientScanHints = (text: string, filename: string, yellowLabel: boolean) => {
-    const joined = `${filename || ""} ${manualScanHint || ""} ${text || ""}`.replace(/\s+/g, " ");
+    const joined = normalizeOcrForParsing(`${filename || ""}\n${manualScanHint || ""}\n${text || ""}`);
     const cardNumbers: string[] = [];
     const setCodes: string[] = [];
     const prices: number[] = [];
-    const fractional = joined.match(/\b\d{1,3}\s*\/\s*\d{1,3}\b/g) || [];
+    const digitSafe = joined.replace(/[OoQ]/g, "0");
+    const fractional = digitSafe.match(/\b\d{1,3}\s*\/\s*\d{1,3}\b/g) || [];
     fractional.forEach(n => {
       const clean = n.replace(/\s+/g, "");
       cardNumbers.push(clean, clean.split("/")[0]);
@@ -2116,26 +2156,114 @@ export default function App() {
       }
     });
     const uniq = (arr: string[]) => Array.from(new Set(arr.filter(Boolean).map(v => v.toUpperCase())));
+    const names = guessCardNamesFromOcr(`${manualScanHint || ""}\n${text || ""}`);
+    const hasJapanese = /[ぁ-んァ-ン一-龯]/.test(joined);
+    const hasLatinCardText = /[A-Za-z]{3,}/.test(joined);
     return {
       text: joined,
       card_numbers: uniq(cardNumbers),
       set_codes: uniq(setCodes),
+      names,
       yen_price: prices[0] || 0,
       yellow_label_detected: yellowLabel || /黄色|キズ|傷|訳あり/i.test(joined),
-      language: /[ぁ-んァ-ン一-龯]/.test(joined) ? "JA" : ""
+      language: hasJapanese ? "JA" : (hasLatinCardText ? "EN" : "")
     };
+  };
+
+  const cropImageForOcr = async (
+    base64DataUrl: string,
+    crop: { name: string; x: number; y: number; w: number; h: number; scale?: number; contrast?: number }
+  ): Promise<{ name: string; dataUrl: string; bounding_box: { ymin: number; xmin: number; ymax: number; xmax: number } } | null> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const sx = Math.max(0, Math.floor(img.width * crop.x));
+        const sy = Math.max(0, Math.floor(img.height * crop.y));
+        const sw = Math.min(img.width - sx, Math.floor(img.width * crop.w));
+        const sh = Math.min(img.height - sy, Math.floor(img.height * crop.h));
+        if (sw <= 0 || sh <= 0) return resolve(null);
+
+        const scale = crop.scale || 2;
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.floor(sw * scale));
+        canvas.height = Math.max(1, Math.floor(sh * scale));
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return resolve(null);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+
+        try {
+          const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const data = imgData.data;
+          const contrast = crop.contrast ?? 1.65;
+          for (let i = 0; i < data.length; i += 4) {
+            const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+            const boosted = Math.max(0, Math.min(255, (gray - 128) * contrast + 128));
+            data[i] = boosted;
+            data[i + 1] = boosted;
+            data[i + 2] = boosted;
+          }
+          ctx.putImageData(imgData, 0, 0);
+        } catch (err) {
+          console.warn(`OCR crop preprocessing skipped for ${crop.name}:`, err);
+        }
+
+        resolve({
+          name: crop.name,
+          dataUrl: canvas.toDataURL("image/png"),
+          bounding_box: {
+            ymin: Math.round(crop.y * 1000),
+            xmin: Math.round(crop.x * 1000),
+            ymax: Math.round((crop.y + crop.h) * 1000),
+            xmax: Math.round((crop.x + crop.w) * 1000)
+          }
+        });
+      };
+      img.onerror = () => resolve(null);
+      img.src = base64DataUrl;
+    });
+  };
+
+  const buildOcrCrops = async (base64DataUrl: string) => {
+    const crops = [
+      { name: "full-card", x: 0.04, y: 0.04, w: 0.92, h: 0.92, scale: 1.45, contrast: 1.35 },
+      { name: "name-top", x: 0.12, y: 0.06, w: 0.70, h: 0.18, scale: 3, contrast: 1.55 },
+      { name: "bottom-number", x: 0.05, y: 0.78, w: 0.62, h: 0.18, scale: 3.4, contrast: 1.95 },
+      { name: "bottom-right-price", x: 0.55, y: 0.70, w: 0.40, h: 0.22, scale: 3.2, contrast: 1.8 },
+      { name: "lower-third", x: 0.05, y: 0.62, w: 0.90, h: 0.30, scale: 2.3, contrast: 1.65 }
+    ];
+    const rendered = await Promise.all(crops.map(crop => cropImageForOcr(base64DataUrl, crop)));
+    return rendered.filter(Boolean) as { name: string; dataUrl: string; bounding_box: { ymin: number; xmin: number; ymax: number; xmax: number } }[];
   };
 
   const createLocalScanPayload = async (base64DataUrl: string, filename: string) => {
     const yellowLabel = await detectYellowLabelFromImage(base64DataUrl);
     let ocrText = "";
+    const localDetections: any[] = [];
     try {
       setScanProgress("Lokale OCR-Engine laden...");
       const Tesseract = await loadTesseract();
       if (Tesseract?.recognize) {
-        setScanProgress("Lokale OCR liest Set-Code, Kartennummer und Yen-Preis...");
-        const result = await Tesseract.recognize(base64DataUrl, "eng+jpn");
-        ocrText = result?.data?.text || "";
+        setScanProgress("Lokale OCR liest Name, Kartennummer und Preiszonen...");
+        const crops = await buildOcrCrops(base64DataUrl);
+        const targets = [{ name: "full-source", dataUrl: base64DataUrl, bounding_box: { ymin: 0, xmin: 0, ymax: 1000, xmax: 1000 } }, ...crops];
+        const texts: string[] = [];
+        for (let i = 0; i < targets.length; i++) {
+          const target = targets[i];
+          setScanProgress(`Lokale OCR liest ${target.name} (${i + 1}/${targets.length})...`);
+          const result = await Tesseract.recognize(target.dataUrl, "eng+jpn");
+          const text = result?.data?.text || "";
+          texts.push(`[${target.name}]\n${text}`);
+          const zoneHints = parseClientScanHints(text, filename, yellowLabel);
+          localDetections.push({
+            zone: target.name,
+            text,
+            ...zoneHints,
+            bounding_box: target.bounding_box
+          });
+        }
+        ocrText = texts.join("\n");
       } else {
         setScanProgress("OCR-CDN nicht erreichbar. Nutze Dateiname/manuelle Hinweise...");
       }
@@ -2146,7 +2274,9 @@ export default function App() {
     return {
       ocrText: `${manualScanHint || ""}\n${ocrText}`.trim(),
       hints,
-      localDetections: [{ text: ocrText, ...hints, bounding_box: { ymin: 80, xmin: 80, ymax: 920, xmax: 920 } }]
+      localDetections: localDetections.length > 0
+        ? localDetections
+        : [{ text: ocrText, ...hints, bounding_box: { ymin: 80, xmin: 80, ymax: 920, xmax: 920 } }]
     };
   };
 
@@ -2160,8 +2290,8 @@ export default function App() {
   const getCachedScanResult = async (filename: string, base64Data: string): Promise<any | null> => {
     try {
       if (typeof window !== "undefined" && "caches" in window) {
-        const cache = await caches.open("pokemon-local-scan-results-v2");
-        const cacheKey = `/api/cards/scan-cache-v2?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
+        const cache = await caches.open("pokemon-local-scan-results-v3");
+        const cacheKey = `/api/cards/scan-cache-v3?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
         const cachedResponse = await cache.match(cacheKey);
         if (cachedResponse) {
           console.log(`Scan-Cache-Treffer für "${filename}" (${base64Data.length} Bytes). Lade sofort lokal!`);
@@ -2177,8 +2307,8 @@ export default function App() {
   const setCachedScanResult = async (filename: string, base64Data: string, data: any): Promise<void> => {
     try {
       if (typeof window !== "undefined" && "caches" in window && data && data.success) {
-        const cache = await caches.open("pokemon-local-scan-results-v2");
-        const cacheKey = `/api/cards/scan-cache-v2?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
+        const cache = await caches.open("pokemon-local-scan-results-v3");
+        const cacheKey = `/api/cards/scan-cache-v3?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
         await cache.put(cacheKey, new Response(JSON.stringify(data), {
           headers: { "Content-Type": "application/json" }
         }));
