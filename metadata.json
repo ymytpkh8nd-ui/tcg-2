@@ -1,0 +1,6 @@
+{
+  "name": "HeoVuiVe PokéCollector",
+  "description": "Premium-Datenbank-Management-Anwendung zur Sammlung und Katalogisierung von Pokémon-Karten auf Basis von SQLite, inklusive intelligentem Rarity-Filter, Live-Synchronisation und interaktiven Dashboards.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

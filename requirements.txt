@@ -1,0 +1,4 @@
+# Pokémon TCG SQLite Database Suite requirements
+# standard python 3 includes sqlite3, urllib.request and json natively.
+# No external package is strictly required, but requests can be installed for utility.
+# pip install -r requirements.txt
