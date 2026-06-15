@@ -3738,17 +3738,22 @@ async function findCardsByLocalHints(parsed: any, game = "pokemon"): Promise<any
     addRows(rows);
   }
 
-  for (const name of searchNames) {
-    const pattern = `%${String(name).toLowerCase()}%`;
-    const rows = await dbAll(`
-      SELECT * FROM cards
-      WHERE game = ?
-        AND (LOWER(pokemon_name) LIKE ? OR LOWER(english_name) LIKE ? OR LOWER(local_name) LIKE ? OR LOWER(japanese_name) LIKE ?)
-      ORDER BY (CASE WHEN UPPER(language) = ? THEN 0 ELSE 1 END), id ASC
-      LIMIT 3
-    `, [game, pattern, pattern, pattern, pattern, lang]);
-    addRows(rows);
-    if (results.length >= 8) break;
+  if (setCodes.length > 0) {
+    for (const setCode of setCodes) {
+      for (const name of searchNames) {
+        const pattern = `%${String(name).toLowerCase()}%`;
+        const rows = await dbAll(`
+          SELECT * FROM cards
+          WHERE game = ?
+            AND (UPPER(set_code) = ? OR UPPER(set_code) LIKE ?)
+            AND (LOWER(pokemon_name) LIKE ? OR LOWER(english_name) LIKE ? OR LOWER(local_name) LIKE ? OR LOWER(japanese_name) LIKE ?)
+          ORDER BY (CASE WHEN UPPER(language) = ? THEN 0 ELSE 1 END), id ASC
+          LIMIT 3
+        `, [game, String(setCode).toUpperCase(), `%${String(setCode).toUpperCase()}%`, pattern, pattern, pattern, pattern, lang]);
+        addRows(rows);
+        if (results.length >= 8) break;
+      }
+    }
   }
 
   return results.slice(0, 12);

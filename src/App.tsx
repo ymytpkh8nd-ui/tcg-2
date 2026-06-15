@@ -2230,6 +2230,8 @@ export default function App() {
       { name: "full-card", x: 0.04, y: 0.04, w: 0.92, h: 0.92, scale: 1.45, contrast: 1.35 },
       { name: "name-top", x: 0.12, y: 0.06, w: 0.70, h: 0.18, scale: 3, contrast: 1.55 },
       { name: "bottom-number", x: 0.05, y: 0.78, w: 0.62, h: 0.18, scale: 3.4, contrast: 1.95 },
+      { name: "bottom-left-number-tight", x: 0.08, y: 0.84, w: 0.42, h: 0.12, scale: 4.2, contrast: 2.15 },
+      { name: "bottom-footer-number", x: 0.10, y: 0.88, w: 0.48, h: 0.08, scale: 4.6, contrast: 2.25 },
       { name: "bottom-right-price", x: 0.55, y: 0.70, w: 0.40, h: 0.22, scale: 3.2, contrast: 1.8 },
       { name: "lower-third", x: 0.05, y: 0.62, w: 0.90, h: 0.30, scale: 2.3, contrast: 1.65 }
     ];
@@ -2252,7 +2254,14 @@ export default function App() {
         for (let i = 0; i < targets.length; i++) {
           const target = targets[i];
           setScanProgress(`Lokale OCR liest ${target.name} (${i + 1}/${targets.length})...`);
-          const result = await Tesseract.recognize(target.dataUrl, "eng+jpn");
+          const numberZone = /number|price|footer/i.test(target.name);
+          const result = await Tesseract.recognize(
+            target.dataUrl,
+            "eng+jpn",
+            numberZone
+              ? { tessedit_char_whitelist: "0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz¥JPY円.- " }
+              : undefined
+          );
           const text = result?.data?.text || "";
           texts.push(`[${target.name}]\n${text}`);
           const zoneHints = parseClientScanHints(text, filename, yellowLabel);
@@ -2290,8 +2299,8 @@ export default function App() {
   const getCachedScanResult = async (filename: string, base64Data: string): Promise<any | null> => {
     try {
       if (typeof window !== "undefined" && "caches" in window) {
-        const cache = await caches.open("pokemon-local-scan-results-v3");
-        const cacheKey = `/api/cards/scan-cache-v3?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
+        const cache = await caches.open("pokemon-local-scan-results-v4");
+        const cacheKey = `/api/cards/scan-cache-v4?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
         const cachedResponse = await cache.match(cacheKey);
         if (cachedResponse) {
           console.log(`Scan-Cache-Treffer für "${filename}" (${base64Data.length} Bytes). Lade sofort lokal!`);
@@ -2307,8 +2316,8 @@ export default function App() {
   const setCachedScanResult = async (filename: string, base64Data: string, data: any): Promise<void> => {
     try {
       if (typeof window !== "undefined" && "caches" in window && data && data.success) {
-        const cache = await caches.open("pokemon-local-scan-results-v3");
-        const cacheKey = `/api/cards/scan-cache-v3?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
+        const cache = await caches.open("pokemon-local-scan-results-v4");
+        const cacheKey = `/api/cards/scan-cache-v4?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
         await cache.put(cacheKey, new Response(JSON.stringify(data), {
           headers: { "Content-Type": "application/json" }
         }));
