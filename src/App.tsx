@@ -39,7 +39,6 @@ import {
   ShieldCheck,
   AlertTriangle,
   CreditCard,
-  Zap,
   Tag,
   Edit,
   Sliders,
@@ -169,8 +168,9 @@ export function formatCardName(card: any): string {
 }
 
 export function getEstimatedCardmarketPrices(card: any) {
-  // Local transparent fallback model. It is NOT a live Cardmarket/eBay quote.
-  if (!card) return { raw: 0, psa8: 0, psa9: 0, psa10: 0, source: "none", confidence: "none" };
+  // Honest price state: only user/imported market prices are treated as prices.
+  // The local model is kept as reference metadata and must not drive BUY decisions.
+  if (!card) return { raw: 0, psa8: 0, psa9: 0, psa10: 0, source: "none", confidence: "none", isMarketPrice: false };
   const text = `${card.english_name || ""} ${card.pokemon_name || ""} ${card.local_name || ""} ${card.rarity || ""} ${card.set_name || ""}`.toLowerCase();
   let score = 28;
   const premiumNames = ["pikachu", "charizard", "glurak", "mew", "mewtwo", "eevee", "umbreon", "nachtara", "rayquaza", "gengar", "lugia", "latias", "latios", "iono", "lillie", "nami", "luffy", "zoro", "shanks", "ace", "law", "yamato"];
@@ -191,31 +191,79 @@ export function getEstimatedCardmarketPrices(card: any) {
   else if (/holo|rare/.test(r)) rawPrice = 1.2;
   rawPrice *= Math.max(0.65, score / 58);
   rawPrice = Math.max(0.05, Math.round(rawPrice * 100) / 100);
+  const manualPrice = Number(card?.manual_market_price_eur || card?.market_price_eur || 0);
+  if (Number.isFinite(manualPrice) && manualPrice > 0) {
+    return {
+      raw: Math.round(manualPrice * 100) / 100,
+      psa8: 0,
+      psa9: 0,
+      psa10: 0,
+      source: card?.market_source || "manual",
+      confidence: "trusted",
+      isMarketPrice: true,
+      referenceModelRaw: rawPrice,
+      reseller_score: score
+    };
+  }
 
   return {
-    raw: rawPrice,
-    psa8: Math.round(rawPrice * 1.45 * 100) / 100,
-    psa9: Math.round(rawPrice * 2.25 * 100) / 100,
-    psa10: Math.round(rawPrice * (score >= 80 ? 7.5 : 4.5) * 100) / 100,
-    source: "local_model",
-    confidence: "fallback_low",
+    raw: 0,
+    psa8: 0,
+    psa9: 0,
+    psa10: 0,
+    source: "missing_market_price",
+    confidence: "missing",
+    isMarketPrice: false,
+    referenceModelRaw: rawPrice,
     reseller_score: score
   };
 }
 
+const printedPokemonSetCodeAliases: Record<string, string> = {
+  SVI: "sv01",
+  PAL: "sv02",
+  OBF: "sv03",
+  MEW: "sv03.5",
+  PAR: "sv04",
+  PAF: "sv04.5",
+  TEF: "sv05",
+  TWM: "sv06",
+  SFA: "sv06.5",
+  SCR: "sv07",
+  SSP: "sv08",
+  PRE: "sv08.5",
+  JTG: "sv09",
+  DRI: "sv10",
+  BLK: "sv10.5b",
+  WHT: "sv10.5w"
+};
+
+const normalizePrintedSetCode = (value: string) => {
+  const clean = String(value || "").replace(/\s+/g, "").toUpperCase();
+  return printedPokemonSetCodeAliases[clean] || clean;
+};
+
+const extractStandaloneCardNumbers = (value: string) => {
+  const out: string[] = [];
+  const rx = /(^|[^0-9/])(\d{1,3})(?!\s*\/|[0-9])/g;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(value || "")) !== null) out.push(m[2]);
+  return out;
+};
+
 export function getLocalDealAnalysis(card: any, exchangeRate = 165, importVat = 19, customsFee = 0.35, platformFee = 12, targetMargin = 30) {
   const prices = getEstimatedCardmarketPrices(card);
   const yenPrice = Number(card?.yen_price || 0);
-  const marketPriceEur = Number(card?.manual_market_price_eur || prices.raw || 0);
+  const marketPriceEur = prices.isMarketPrice ? Number(prices.raw || 0) : 0;
   const landedCostEur = yenPrice > 0 ? (yenPrice / exchangeRate) * (1 + importVat / 100) + customsFee : 0;
   const netRevenueEur = marketPriceEur * (1 - platformFee / 100);
   const expectedProfitEur = landedCostEur > 0 ? netRevenueEur - landedCostEur : 0;
   const roiPercent = landedCostEur > 0 ? (expectedProfitEur / landedCostEur) * 100 : 0;
-  const requiredCostEur = netRevenueEur / (1 + targetMargin / 100);
-  const maxBuyYen = Math.max(0, Math.floor(((requiredCostEur - customsFee) / (1 + importVat / 100)) * exchangeRate));
+  const requiredCostEur = marketPriceEur > 0 ? netRevenueEur / (1 + targetMargin / 100) : 0;
+  const maxBuyYen = marketPriceEur > 0 ? Math.max(0, Math.floor(((requiredCostEur - customsFee) / (1 + importVat / 100)) * exchangeRate)) : 0;
   let decision: "BUY" | "CHECK" | "SKIP" = "CHECK";
-  if (yenPrice > 0 && yenPrice <= maxBuyYen && expectedProfitEur >= Math.max(3, marketPriceEur * 0.12)) decision = "BUY";
-  if (yenPrice > 0 && (yenPrice > maxBuyYen || expectedProfitEur < 1)) decision = "SKIP";
+  if (marketPriceEur > 0 && yenPrice > 0 && yenPrice <= maxBuyYen && expectedProfitEur >= Math.max(3, marketPriceEur * 0.12)) decision = "BUY";
+  if (marketPriceEur > 0 && yenPrice > 0 && (yenPrice > maxBuyYen || expectedProfitEur < 1)) decision = "SKIP";
   return {
     marketPriceEur,
     landedCostEur,
@@ -224,8 +272,10 @@ export function getLocalDealAnalysis(card: any, exchangeRate = 165, importVat = 
     roiPercent,
     maxBuyYen,
     decision,
-    priceSource: card?.manual_market_price_eur ? "manual" : "local_model_fallback",
-    priceConfidence: card?.manual_market_price_eur ? "high" : "low"
+    priceSource: prices.source,
+    priceConfidence: prices.confidence,
+    marketPriceRequired: !prices.isMarketPrice,
+    referenceModelRaw: prices.referenceModelRaw || 0
   };
 }
 
@@ -935,11 +985,12 @@ export default function App() {
   const [scanResult, setScanResult] = useState<any | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [turboScan, setTurboScan] = useState<boolean>(true);
-  const [grayscaleScan, setGrayscaleScan] = useState<boolean>(true);
   const [manualScanHint, setManualScanHint] = useState<string>("");
   const [isCameraActive, setIsCameraActive] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const visualCandidateCacheRef = useRef<Record<string, any[]>>({});
+  const visualSignatureCacheRef = useRef<Record<string, number[] | null>>({});
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
 
   // Live camera analysis states for direct interactive feedback
@@ -2009,32 +2060,6 @@ export default function App() {
         if (ctx) {
           ctx.drawImage(img, 0, 0, width, height);
 
-          if (grayscaleScan) {
-            try {
-              const imgData = ctx.getImageData(0, 0, width, height);
-              const data = imgData.data;
-              for (let i = 0; i < data.length; i += 4) {
-                const r = data[i];
-                const g = data[i + 1];
-                const b = data[i + 2];
-                // Grayscale formula
-                let gray = 0.299 * r + 0.587 * g + 0.114 * b;
-                
-                // Contrast boost for local OCR on set codes and card numbers
-                gray = (gray - 128) * 1.35 + 128;
-                if (gray < 0) gray = 0;
-                if (gray > 255) gray = 255;
-
-                data[i] = gray;
-                data[i + 1] = gray;
-                data[i + 2] = gray;
-              }
-              ctx.putImageData(imgData, 0, 0);
-            } catch (canvasErr) {
-              console.warn("Canvas grayscale manipulation skipped:", canvasErr);
-            }
-          }
-
           resolve(canvas.toDataURL("image/jpeg", 0.75));
         } else {
           resolve(base64Str);
@@ -2130,7 +2155,7 @@ export default function App() {
     return Array.from(new Set(candidates)).slice(0, 6);
   };
 
-  const parseClientScanHints = (text: string, filename: string, yellowLabel: boolean) => {
+  const parseClientScanHints = (text: string, filename: string, yellowLabel: boolean, zoneName = "") => {
     const joined = normalizeOcrForParsing(`${filename || ""}\n${manualScanHint || ""}\n${text || ""}`);
     const cardNumbers: string[] = [];
     const setCodes: string[] = [];
@@ -2145,8 +2170,19 @@ export default function App() {
     cardNumbers.push(...opNums.map(v => v.replace(/\s+/g, "").toUpperCase()));
     const opSets = joined.match(/\b(?:OP|ST|EB|PR)[ -]?\d{1,2}\b/gi) || [];
     setCodes.push(...opSets.map(v => v.replace(/[\s-]/g, "").toUpperCase()));
-    const pokemonSets = joined.match(/\b(?:SV-P|S-P|SM-P|SV|SM|S|XY|BW|DP|ADV|PCG)[ -]?\d{0,2}[A-Z]?\b/gi) || [];
+    const pokemonSets = joined.match(/\b(?:SV-P|S-P|SM-P|SV[ -]?\d{1,2}[A-Z]?|SM[ -]?\d{1,2}[A-Z]?|S[ -]?\d{1,2}[A-Z]?|XY[ -]?\d{1,2}[A-Z]?|BW[ -]?\d{1,2}[A-Z]?|DP[ -]?\d{1,2}[A-Z]?|ADV[ -]?\d{1,2}[A-Z]?|PCG[ -]?\d{1,2}[A-Z]?)\b/gi) || [];
     setCodes.push(...pokemonSets.map(v => v.replace(/\s+/g, "").toUpperCase()));
+    const tcgdexLikeSets = joined.match(/\b(?:SV|SM|S|XY|BW|DP|ADV|PCG|ME|A|B)[ -]?\d{1,2}(?:\.\d+)?[A-Z]?\b/gi) || [];
+    setCodes.push(...tcgdexLikeSets.map(v => v.replace(/\s+/g, "").toUpperCase()));
+    const printedAliases = Object.keys(printedPokemonSetCodeAliases).join("|");
+    const printedSetRx = new RegExp(`\\b(${printedAliases})\\s*(?:EN|DE|FR|IT|ES|PT)?\\b`, "gi");
+    let printedSetMatch: RegExpExecArray | null;
+    while ((printedSetMatch = printedSetRx.exec(joined)) !== null) {
+      setCodes.push(printedPokemonSetCodeAliases[String(printedSetMatch[1]).toUpperCase()]);
+    }
+    if (setCodes.length > 0) {
+      cardNumbers.push(...extractStandaloneCardNumbers(joined));
+    }
     const priceRegexes = [/(?:¥|￥|JPY)\s*([0-9][0-9,. ]{1,8})/g, /([0-9][0-9,. ]{1,8})\s*(?:円|yen|YEN)/g];
     priceRegexes.forEach(rx => {
       let m: RegExpExecArray | null;
@@ -2155,6 +2191,13 @@ export default function App() {
         if (!isNaN(n) && n >= 30 && n <= 300000) prices.push(n);
       }
     });
+    if (/price|preis|label|yen/i.test(zoneName)) {
+      const plainPrices = digitSafe.match(/\b\d{3,6}\b/g) || [];
+      plainPrices.forEach(raw => {
+        const n = parseInt(raw, 10);
+        if (!isNaN(n) && n >= 100 && n <= 300000) prices.push(n);
+      });
+    }
     const uniq = (arr: string[]) => Array.from(new Set(arr.filter(Boolean).map(v => v.toUpperCase())));
     const names = guessCardNamesFromOcr(`${manualScanHint || ""}\n${text || ""}`);
     const hasJapanese = /[ぁ-んァ-ン一-龯]/.test(joined);
@@ -2162,7 +2205,11 @@ export default function App() {
     return {
       text: joined,
       card_numbers: uniq(cardNumbers),
-      set_codes: uniq(setCodes),
+      set_codes: uniq(setCodes.map(normalizePrintedSetCode)).filter(code => {
+        const clean = code.replace(/\s+/g, "").toUpperCase();
+        if (/^(SV|SM|S|XY|BW|DP|ADV|PCG|OP|ST|EB|PR)$/.test(clean)) return false;
+        return clean.length >= 2 && /\d|-P$/.test(clean);
+      }),
       names,
       yen_price: prices[0] || 0,
       yellow_label_detected: yellowLabel || /黄色|キズ|傷|訳あり/i.test(joined),
@@ -2239,6 +2286,146 @@ export default function App() {
     return rendered.filter(Boolean) as { name: string; dataUrl: string; bounding_box: { ymin: number; xmin: number; ymax: number; xmax: number } }[];
   };
 
+  const computeImageSignature = async (src: string, cropCard = false): Promise<number[] | null> => {
+    if (!src) return null;
+    if (visualSignatureCacheRef.current[src]) return visualSignatureCacheRef.current[src];
+
+    const signature = await new Promise<number[] | null>((resolve) => {
+      const img = new Image();
+      if (!src.startsWith("data:")) img.crossOrigin = "anonymous";
+      img.onload = () => {
+        try {
+          const size = 16;
+          const canvas = document.createElement("canvas");
+          canvas.width = size;
+          canvas.height = size;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return resolve(null);
+
+          const sx = cropCard ? Math.floor(img.width * 0.08) : 0;
+          const sy = cropCard ? Math.floor(img.height * 0.04) : 0;
+          const sw = cropCard ? Math.floor(img.width * 0.84) : img.width;
+          const sh = cropCard ? Math.floor(img.height * 0.92) : img.height;
+          ctx.drawImage(img, sx, sy, sw, sh, 0, 0, size, size);
+          const pixels = ctx.getImageData(0, 0, size, size).data;
+          const values: number[] = [];
+          for (let i = 0; i < pixels.length; i += 4) {
+            values.push((0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2]) / 255);
+          }
+          const mean = values.reduce((sum, v) => sum + v, 0) / values.length;
+          const variance = values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / values.length;
+          const std = Math.sqrt(variance) || 1;
+          resolve(values.map(v => (v - mean) / std));
+        } catch {
+          resolve(null);
+        }
+      };
+      img.onerror = () => resolve(null);
+      img.src = src;
+    });
+
+    visualSignatureCacheRef.current[src] = signature;
+    return signature;
+  };
+
+  const compareImageSignatures = (a: number[] | null, b: number[] | null) => {
+    if (!a || !b || a.length !== b.length) return 0;
+    let dot = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    if (!normA || !normB) return 0;
+    return Math.max(0, Math.min(1, (dot / Math.sqrt(normA * normB) + 1) / 2));
+  };
+
+  const loadVisualCandidates = async () => {
+    const key = `${activeGame}:EN`;
+    if (visualCandidateCacheRef.current[key]) return visualCandidateCacheRef.current[key];
+    const response = await fetch(`/api/cards/visual-candidates?game=${encodeURIComponent(activeGame)}&language=EN&limit=3000`);
+    if (!response.ok) return [];
+    const data = await response.json();
+    const cards = Array.isArray(data.cards) ? data.cards : [];
+    visualCandidateCacheRef.current[key] = cards;
+    return cards;
+  };
+
+  const findVisualMatches = async (base64DataUrl: string) => {
+    const sourceSignature = await computeImageSignature(base64DataUrl, true);
+    if (!sourceSignature) return [];
+    const candidates = await loadVisualCandidates();
+    const scored: any[] = [];
+    const batchSize = 16;
+
+    for (let i = 0; i < candidates.length; i += batchSize) {
+      setScanProgress(`Lokaler Bildabgleich ${Math.min(i + batchSize, candidates.length)}/${candidates.length}...`);
+      const batch = candidates.slice(i, i + batchSize);
+      const batchScores = await Promise.all(batch.map(async (card: any) => {
+        const img = card.image_small || card.image_large;
+        const sig = await computeImageSignature(img, false);
+        const score = compareImageSignatures(sourceSignature, sig);
+        return { card, score };
+      }));
+      scored.push(...batchScores.filter(item => item.score >= 0.82));
+      if (scored.some(item => item.score >= 0.91)) break;
+    }
+
+    return scored
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3)
+      .map(({ card, score }) => ({
+        ...card,
+        ai_confidence: score,
+        similarity_score: Math.round(score * 100),
+        hash_match_score: Math.round(score * 100),
+        verification_status: "Lokaler Bildabgleich",
+        scanner_source: "local_visual_match"
+      }));
+  };
+
+  const applyVisualFallback = async (data: any, base64DataUrl: string) => {
+    const hasOcrMatch = Array.isArray(data?.matched_cards) && data.matched_cards.length > 0;
+    if (hasOcrMatch) return data;
+    if (activeGame === "pokemon") {
+      return {
+        ...data,
+        visual_fallback_skipped: true,
+        message: data?.message || "Kein sicherer OCR/DB-Treffer. Bildabgleich wurde fuer Pokemon deaktiviert, damit keine falschen Karten uebernommen werden."
+      };
+    }
+
+    setScanProgress("Kein OCR-Treffer. Vergleiche Bild lokal mit Kartenbildern...");
+    const visualMatches = await findVisualMatches(base64DataUrl);
+    if (visualMatches.length === 0) return data;
+
+    const identifications = visualMatches.map((card: any) => ({
+      pokemon_name: card.pokemon_name || card.english_name || card.local_name || "Unbekannt",
+      card_number: card.card_number || "?",
+      set_code: card.set_code || "",
+      language: card.language || "EN",
+      yen_price: 0,
+      yellow_label_detected: false,
+      bounding_box: { ymin: 80, xmin: 80, ymax: 920, xmax: 920 },
+      confidence: card.ai_confidence || 0,
+      similarity_score: card.similarity_score || 0,
+      hash_match_score: card.hash_match_score || 0,
+      verification_status: "Lokaler Bildabgleich",
+      scanner_source: "local_visual_match"
+    }));
+
+    return {
+      ...data,
+      match: true,
+      matched_cards: visualMatches,
+      ai_identifications: identifications,
+      local_identifications: identifications,
+      message: `${visualMatches.length} Treffer per lokalem Bildabgleich gefunden.`
+    };
+  };
+
   const createLocalScanPayload = async (base64DataUrl: string, filename: string) => {
     const yellowLabel = await detectYellowLabelFromImage(base64DataUrl);
     let ocrText = "";
@@ -2264,7 +2451,7 @@ export default function App() {
           );
           const text = result?.data?.text || "";
           texts.push(`[${target.name}]\n${text}`);
-          const zoneHints = parseClientScanHints(text, filename, yellowLabel);
+          const zoneHints = parseClientScanHints(text, filename, yellowLabel, target.name);
           localDetections.push({
             zone: target.name,
             text,
@@ -2292,15 +2479,16 @@ export default function App() {
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (files && files.length > 0) {
-      handleScanMultipleImages(Array.from(files));
+      handleScanMultipleImages(Array.from<File>(files).slice(0, 1));
+      e.target.value = "";
     }
   };
 
   const getCachedScanResult = async (filename: string, base64Data: string): Promise<any | null> => {
     try {
       if (typeof window !== "undefined" && "caches" in window) {
-        const cache = await caches.open("pokemon-local-scan-results-v4");
-        const cacheKey = `/api/cards/scan-cache-v4?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
+        const cache = await caches.open("pokemon-local-scan-results-v8-set-alias");
+        const cacheKey = `/api/cards/scan-cache-v8-set-alias?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
         const cachedResponse = await cache.match(cacheKey);
         if (cachedResponse) {
           console.log(`Scan-Cache-Treffer für "${filename}" (${base64Data.length} Bytes). Lade sofort lokal!`);
@@ -2316,8 +2504,8 @@ export default function App() {
   const setCachedScanResult = async (filename: string, base64Data: string, data: any): Promise<void> => {
     try {
       if (typeof window !== "undefined" && "caches" in window && data && data.success) {
-        const cache = await caches.open("pokemon-local-scan-results-v4");
-        const cacheKey = `/api/cards/scan-cache-v4?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
+        const cache = await caches.open("pokemon-local-scan-results-v8-set-alias");
+        const cacheKey = `/api/cards/scan-cache-v8-set-alias?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
         await cache.put(cacheKey, new Response(JSON.stringify(data), {
           headers: { "Content-Type": "application/json" }
         }));
@@ -2328,16 +2516,48 @@ export default function App() {
     }
   };
 
+  const pickBestScanCard = (cards: any[] = []) => {
+    if (!Array.isArray(cards) || cards.length === 0) return null;
+    const seen = new Set<string>();
+    const uniqueCards = cards.filter((card) => {
+      const key = `${card.api_card_id || card.id}-${card.language || ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return uniqueCards
+      .map((card) => {
+        const baseScore = Number(card.similarity_score || 0) || Math.round(Number(card.ai_confidence || 0) * 100);
+        const source = String(card.scanner_source || card.verification_status || "").toLowerCase();
+        const sourceBoost = source.includes("local_ocr") ? 8 : source.includes("visual") ? 5 : source.includes("segment") ? -14 : 0;
+        const numberBoost = card.card_number && card.card_number !== "?" ? 3 : 0;
+        return { card, rank: baseScore + sourceBoost + numberBoost };
+      })
+      .sort((a, b) => b.rank - a.rank)
+      .find(({ card, rank }) => rank >= 80 || String(card.scanner_source || "").includes("filename"))
+      ?.card || null;
+  };
+
+  const createSwipeCard = (card: any, sourceImage: string, index = 0) => {
+    const notesText = card.yellow_label_detected ? "Gelbes Label (Maengel/キズあり)" : "";
+    return {
+      ...card,
+      notes: card.notes || notesText,
+      imageSourceBase64: sourceImage,
+      swipeInstanceId: `${card.id || card.api_card_id || "scan"}_${Date.now()}_${index}_${Math.random().toString(36).substr(2, 5)}`
+    };
+  };
+
   const handleScanMultipleImages = async (files: File[]) => {
     setScanLoading(true);
     setScanError(null);
     setScanResult(null);
-    setScanProgress("Komprimiere hochgeladene Bilder...");
+    setScanProgress("Bereite Kartenfoto vor...");
 
     try {
       const compressedList: string[] = [];
       const nameList: string[] = [];
-      for (const file of files) {
+      for (const file of files.slice(0, 1)) {
         const rawBase64 = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onloadend = () => resolve(reader.result as string);
@@ -2349,18 +2569,16 @@ export default function App() {
         nameList.push(file.name);
       }
 
-      // Update images queue
-      const oldLen = scannedImages.length;
-      const updatedImages = [...scannedImages, ...compressedList];
+      const updatedImages = compressedList;
       setScannedImages(updatedImages);
-      setScannedImageNames(prev => [...prev, ...nameList]);
+      setScannedImageNames(nameList);
       setScanImage(compressedList[0]);
-      setActiveImageIndex(oldLen);
+      setActiveImageIndex(0);
 
       const allMatchedCards: any[] = [];
       const allAiIdentifications: any[] = [];
 
-      setScanProgress(`Sende ${compressedList.length} Bilder zur Analyse...`);
+      setScanProgress("Scanne eine Karte...");
 
       const scanResults: any[] = [];
       for (let i = 0; i < compressedList.length; i++) {
@@ -2400,7 +2618,8 @@ export default function App() {
           throw new Error(errDetails.error || `Fehler bei Bild ${i + 1}`);
         }
 
-        const data = await r.json();
+        let data = await r.json();
+        data = await applyVisualFallback(data, base64DataUrl);
         await setCachedScanResult(currentFilename, base64Data, data);
         scanResults.push(data);
       }
@@ -2409,12 +2628,9 @@ export default function App() {
         const data = scanResults[i];
         const sourceImg = compressedList[i];
         if (data.success) {
-          if (data.matched_cards) {
-            const cardsWithSource = data.matched_cards.map((c: any) => ({
-              ...c,
-              imageSourceBase64: sourceImg
-            }));
-            allMatchedCards.push(...cardsWithSource);
+          const bestCard = pickBestScanCard(data.matched_cards || []);
+          if (bestCard) {
+            allMatchedCards.push(createSwipeCard(bestCard, sourceImg, i));
           }
           if (data.ai_identifications) {
             allAiIdentifications.push(...data.ai_identifications);
@@ -2429,20 +2645,7 @@ export default function App() {
         ai_identifications: allAiIdentifications
       });
       
-      // Inject unique swipeInstanceId and pre-fill note check to each matched card
-      const matchedWithInstanceId = allMatchedCards.map((c, index) => {
-        let notesText = "";
-        if (c.yellow_label_detected) {
-          notesText = "⚠️ Gelbes Label (Mängel/キズあり)";
-        }
-        return {
-          ...c,
-          notes: notesText,
-          swipeInstanceId: `${c.id}_${Date.now()}_${index}_${Math.random().toString(36).substr(2, 5)}`
-        };
-      });
-
-      setSwipeDeck(prev => [...prev, ...matchedWithInstanceId]);
+      setSwipeDeck(prev => [...prev, ...allMatchedCards]);
       setScanProgress("");
 
     } catch (err: any) {
@@ -2476,12 +2679,9 @@ export default function App() {
         const compressedDataUrl = await compressAndResizeImage(base64DataUrl);
         finalBase64 = compressedDataUrl;
 
-        if (!scannedImages.includes(compressedDataUrl)) {
-          const oldLen = scannedImages.length;
-          setScannedImages(prev => [...prev, compressedDataUrl]);
-          setScannedImageNames(prev => [...prev, "Kamera_Snapshot.jpg"]);
-          setActiveImageIndex(oldLen);
-        }
+        setScannedImages([compressedDataUrl]);
+        setScannedImageNames(["Kamera_Snapshot.jpg"]);
+        setActiveImageIndex(0);
       }
 
       setScanImage(finalBase64);
@@ -2518,24 +2718,16 @@ export default function App() {
         }
 
         data = await r.json();
+        data = await applyVisualFallback(data, finalBase64);
         await setCachedScanResult(filename, base64Data, data);
       }
 
       setScanResult(data);
       if (data.success && data.matched_cards && data.matched_cards.length > 0) {
-        const matchedWithInstanceId = data.matched_cards.map((c: any, index: number) => {
-          let notesText = "";
-          if (c.yellow_label_detected) {
-            notesText = "⚠️ Gelbes Label (Mängel/キズあり)";
-          }
-          return {
-            ...c,
-            notes: notesText,
-            imageSourceBase64: finalBase64, // SAVE the EXACT source image on the card!
-            swipeInstanceId: `${c.id}_${Date.now()}_${index}_${Math.random().toString(36).substr(2, 5)}`
-          };
-        });
-        setSwipeDeck(prev => [...prev, ...matchedWithInstanceId]);
+        const bestCard = pickBestScanCard(data.matched_cards);
+        if (bestCard) {
+          setSwipeDeck(prev => [...prev, createSwipeCard(bestCard, finalBase64, 0)]);
+        }
       } else if (data.success) {
         setScanError("Keine Pokémon-Karte erkannt. Bitte stellen Sie sicher, dass die Karte gut beleuchtet und flach fotografiert ist, und versuchen Sie es erneut.");
       }
@@ -4791,372 +4983,154 @@ export default function App() {
         {/* TAB 1.5: KARTEN-BILDER-EXPLORER */}
         {activeTab === "image-explorer" && (
           <div className="space-y-6" id="image-explorer-view">
-            {/* Header / Intro */}
             <div className="bg-[#121214] p-5 rounded-2xl border border-[#222226] flex flex-col md:flex-row justify-between items-start md:items-center gap-4 shadow-xl">
               <div>
                 <h2 className="text-base font-bold font-display text-zinc-100 flex items-center gap-2">
-                  <Camera className="text-red-500 w-5 h-5 animate-pulse" />
-                  Karten-Bilder-Scanner & Multi-Swiper (Japan Reseller Edition)
+                  <Camera className="text-red-500 w-5 h-5" />
+                  Karten-Scanner
                 </h2>
                 <p className="text-xs text-[#a1a1aa] mt-0.5 leading-relaxed">
-                  Fotografiere eine oder mehrere Karten. Die App liest lokal per OCR Set-Code, Kartennummer und Yen-Preis und gleicht alles gegen SQLite ab. Wische nach rechts für deinen Einkaufs-Warenkorb!
+                  Eine Karte fotografieren oder hochladen, erkennen lassen und direkt in den Swipe-Stapel legen.
                 </p>
               </div>
-              <div 
-                onClick={() => setShowJaResellerInfo(!showJaResellerInfo)}
-                className="flex items-center gap-2 bg-[#202024]/50 hover:bg-[#202024] px-3.5 py-1.5 rounded-xl border border-zinc-800/80 cursor-pointer select-none transition"
-                title="Erfahre mehr über JA-Reseller Active"
-              >
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping"></span>
-                <span className="text-[10px] font-mono text-zinc-400 flex items-center gap-1.5">
-                  JA-Reseller Active <span className="text-zinc-500">❓</span>
-                </span>
+              <div className="flex items-center gap-2 text-[10px] font-mono text-zinc-500">
+                <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950/60">1 Bild</span>
+                <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950/60">1 bester Treffer</span>
+                <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950/60">Swipe</span>
               </div>
             </div>
 
-            {showJaResellerInfo && (
-              <motion.div 
-                initial={{ opacity: 0, y: -10 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="bg-[#121214] border border-red-500/10 p-5 rounded-2xl relative shadow-2xl space-y-2.5"
-              >
-                <button 
-                  onClick={() => setShowJaResellerInfo(false)}
-                  className="absolute top-4 right-4 text-zinc-500 hover:text-zinc-300 transition cursor-pointer"
-                  title="Schließen"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-                <h4 className="text-xs font-bold font-display text-red-500 uppercase tracking-wider flex items-center gap-2">
-                  🇯🇵 Was ist &quot;JA-Reseller Active&quot;?
-                </h4>
-                <div className="text-xs text-zinc-400 space-y-2.5 leading-relaxed">
-                  <p>
-                    <strong>JA-Reseller Active (Japan Reseller Active)</strong> bedeutet, dass diese Instanz für TCG-Händler konfiguriert ist, die Karten aus Japan einkaufen (z. B. auf Flohmärkten, aus Book-Off Vitrinen oder Online-Märkten) und gewinnbringend weiterverkaufen.
-                  </p>
-                  <p>
-                    <strong>Automatische Kern-Features in dieser Ansicht:</strong>
-                  </p>
-                  <ul className="list-disc pl-5 space-y-1.5 text-zinc-350">
-                    <li>
-                      <strong className="text-red-400">Yen-Preisauslesung (¥):</strong> Der Scanner prüft das Bild automatisch nach Preisschildern/Aufklebern und trägt den erkannten Betrag im Feld <code className="bg-zinc-950 px-1 py-0.2 rounded text-amber-400">Yen-Preis</code> ein.
-                    </li>
-                    <li>
-                      <strong className="text-red-400">Automatische Euro-Wechselkursumrechnung:</strong> Alle Yen-Preise werden in Euro (€) umgerechnet (Basis: 1 EUR ≈ 165 JPY) und direkt übersichtlich angezeigt.
-                    </li>
-                    <li>
-                      <strong className="text-red-400">Direktes Editieren:</strong> Der ausgelesene oder selbst eingetragene Yen-Betrag dient als Einkaufspreis der Karte und kann bequem direkt an der Karte oder im Warenkorb geändert werden!
-                    </li>
-                  </ul>
-                </div>
-              </motion.div>
-            )}
-
             <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-              {/* Left Column: Image Area & Detected Metadata Badges (Column Span 4) */}
               <div className="xl:col-span-4 bg-[#121214] border border-[#222226] p-5 rounded-2xl flex flex-col space-y-4 shadow-sm">
-                <div>
-                  <h3 className="text-xs font-bold font-display text-zinc-400 mb-3 flex items-center justify-between uppercase tracking-wider">
-                    <span className="flex items-center gap-2">
-                      <Layers className="w-3.5 h-3.5 text-zinc-550" />
-                      1. Quelle & Scan-Fotos ({scannedImages.length})
-                    </span>
-                    {scannedImages.length > 0 && (
-                      <button
-                        onClick={() => {
-                          setScannedImages([]);
-                          setScanImage(null);
-                          setScanResult(null);
-                          setSwipeDeck([]);
-                          setDeckIndex(0);
-                        }}
-                        className="text-[9px] font-mono text-zinc-500 hover:text-red-400 transition cursor-pointer"
-                      >
-                        Alle leeren
-                      </button>
-                    )}
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold font-display text-zinc-300 flex items-center gap-2 uppercase tracking-wider">
+                    <Camera className="w-4 h-4 text-red-500" />
+                    Karte scannen
                   </h3>
+                  {(scanImage || scannedImages.length > 0) && (
+                    <button
+                      onClick={() => {
+                        setScannedImages([]);
+                        setScannedImageNames([]);
+                        setScanImage(null);
+                        setScanResult(null);
+                        setScanError(null);
+                      }}
+                      className="text-[10px] font-mono text-zinc-500 hover:text-red-400 transition cursor-pointer"
+                    >
+                      Zurücksetzen
+                    </button>
+                  )}
+                </div>
 
+                <div className="relative aspect-[3/4] w-full rounded-2xl border border-zinc-800 bg-[#09090b] overflow-hidden flex items-center justify-center">
                   {isCameraActive ? (
-                    /* Active Video Feed */
-                    <div className="relative w-full max-h-[300px] aspect-[4/3] bg-black rounded-xl overflow-hidden border border-[#222226] flex items-center justify-center">
-                      <video 
-                        ref={videoRef} 
-                        playsInline 
-                        muted 
-                        className="w-full h-full object-cover" 
-                      />
-                      
-                      {/* Laser grid visualizer overlay */}
-                      <div className="absolute inset-0 border-[16px] border-black/50 pointer-events-none flex items-center justify-center">
-                        <div className="w-[85%] h-[85%] border border-[#dc2626]/40 border-dashed rounded relative">
-                          <div className="absolute -top-1 -left-1 w-3.5 h-3.5 border-t-2 border-l-2 border-red-500"></div>
-                          <div className="absolute -top-1 -right-1 w-3.5 h-3.5 border-t-2 border-r-2 border-red-500"></div>
-                          <div className="absolute -bottom-1 -left-1 w-3.5 h-3.5 border-b-2 border-l-2 border-red-500"></div>
-                          <div className="absolute -bottom-1 -right-1 w-3.5 h-3.5 border-b-2 border-r-2 border-red-500"></div>
-                          <div className="absolute left-0 right-0 h-0.5 bg-red-500/80 animate-bounce" style={{ top: '30%' }}></div>
-                        </div>
+                    <>
+                      <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
+                      <div className="absolute inset-5 border border-red-500/50 rounded-xl pointer-events-none">
+                        <div className="absolute left-0 right-0 top-[18%] h-px bg-red-500/50" />
+                        <div className="absolute left-0 right-0 bottom-[16%] h-px bg-red-500/50" />
                       </div>
-
-                      {/* Small Live Diagnostics Indicator */}
-                      <div className="absolute top-2 left-2 right-2 flex justify-between items-center z-10 pointer-events-none">
-                        <span className="bg-black/90 backdrop-blur-md px-2 py-0.5 text-[8px] font-mono text-green-400 rounded border border-green-500/20 uppercase font-black">
-                          Kamera Aktiv ✓
-                        </span>
-                        <span className={`px-2 py-0.5 text-[8px] font-mono rounded border capitalize font-bold backdrop-blur-md ${
-                          isScannable 
-                            ? "bg-emerald-950/90 text-emerald-400 border-emerald-500/20" 
-                            : "bg-amber-950/90 text-amber-400 border-amber-500/20"
-                        }`}>
-                          {isScannable ? "Licht optimal" : liveScannableMsg}
-                        </span>
-                      </div>
-
-                      {/* Diagnostic details (bottom) */}
-                      <div className="absolute bottom-2 inset-x-2 flex justify-between text-[8px] font-mono text-zinc-400 bg-black/80 backdrop-blur-md px-2 py-1 rounded border border-zinc-800 pointer-events-none">
-                        <span>💡 LICHT: <strong className={liveBrightness < 18 || liveBrightness > 86 ? "text-amber-400" : "text-emerald-400"}>{liveBrightness}%</strong></span>
-                        <span>🔬 KONTRAST: <strong className={liveContrast === "SCHLECHT" ? "text-amber-400" : "text-emerald-300"}>{liveContrast}</strong></span>
-                      </div>
-                    </div>
-                  ) : scannedImages.length > 0 ? (
-                    /* Multi-Image Interactive Viewport Grid */
-                    <div className="space-y-3">
-                      {/* Properly Resized Image Preview Frame */}
-                      <div className="relative w-full flex flex-col bg-[#09090b] rounded-xl overflow-hidden border border-zinc-850 p-2.5 shadow-inner">
-                        <div className="w-full flex items-center justify-center max-h-[220px] md:max-h-[260px] bg-[#0c0c0e] rounded-lg">
-                          <img 
-                            src={scannedImages[activeImageIndex] || scanImage || ""} 
-                            alt="Hochgeladene Pokémon-Karten" 
-                            className="max-h-[220px] md:max-h-[260px] w-auto max-w-full object-contain rounded-md" 
-                          />
-                        </div>
-                        <button 
-                          onClick={() => {
-                            const updated = scannedImages.filter((_, idx) => idx !== activeImageIndex);
-                            setScannedImages(updated);
-                            const updatedNames = scannedImageNames.filter((_, idx) => idx !== activeImageIndex);
-                            setScannedImageNames(updatedNames);
-                            if (updated.length > 0) {
-                              const newIdx = Math.max(0, activeImageIndex - 1);
-                              setActiveImageIndex(newIdx);
-                              setScanImage(updated[newIdx]);
-                            } else {
-                              setScanImage(null);
-                              setScanResult(null);
-                              setSwipeDeck([]);
-                              setDeckIndex(0);
-                            }
-                          }}
-                          className="absolute top-4 right-4 bg-red-650/90 hover:bg-red-600 text-white p-1.5 rounded-lg border border-red-500/25 shadow-md hover:scale-105 transition cursor-pointer"
-                          title="Dieses Bild entfernen"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                        <div className="mt-2 text-center text-[9px] text-zinc-500 font-mono">
-                          Bild {activeImageIndex + 1} von {scannedImages.length}
-                        </div>
-                      </div>
-
-                      {/* Horizontal Thumbnail Strip */}
-                      <div className="flex items-center gap-2 overflow-x-auto py-1 pr-1 scrollbar-none">
-                        {scannedImages.map((img, idx) => (
-                          <div 
-                            key={idx}
-                            onClick={() => {
-                              setActiveImageIndex(idx);
-                              setScanImage(img);
-                            }}
-                            className={`relative w-11 h-11 shrink-0 rounded-lg overflow-hidden border-2 cursor-pointer transition ${idx === activeImageIndex ? "border-red-500 scale-105 shadow-[0_0_8px_rgba(239,68,68,0.4)]" : "border-zinc-800 hover:border-zinc-700"}`}
-                          >
-                            <img src={img} className="w-full h-full object-cover" />
-                            <span className="absolute bottom-0 right-0 bg-black/80 text-[7px] px-1 font-mono text-zinc-400 rounded-tl">
-                              #{idx + 1}
-                            </span>
-                          </div>
-                        ))}
-                        {/* Plus Add Button inside thumbnail strip */}
-                        <label className="w-11 h-11 shrink-0 border-2 border-dashed border-zinc-800 hover:border-red-500/30 rounded-lg flex flex-col items-center justify-center bg-zinc-950/40 hover:bg-zinc-950 transition cursor-pointer">
-                          <input 
-                            type="file" 
-                            accept="image/*" 
-                            multiple
-                            onChange={handleImageUpload} 
-                            className="sr-only" 
-                          />
-                          <Plus className="w-3.5 h-3.5 text-zinc-500" />
-                          <span className="text-[6px] font-mono text-zinc-650 mt-0.5">Mehr</span>
-                        </label>
-                      </div>
-                    </div>
+                    </>
+                  ) : scanImage ? (
+                    <img
+                      src={scanImage}
+                      alt="Zu scannende Karte"
+                      className="max-h-full max-w-full object-contain"
+                    />
                   ) : (
-                    /* Drag & Drop Zone */
-                    <label className="flex flex-col items-center justify-center aspect-[4/3] max-h-[240px] bg-[#0c0c0e] hover:bg-[#121215] border-2 border-dashed border-zinc-800 hover:border-red-500/25 rounded-2xl transition cursor-pointer p-5 group relative">
-                      <input 
-                        type="file" 
-                        accept="image/*" 
-                        multiple 
-                        onChange={handleImageUpload} 
-                        className="sr-only" 
+                    <label className="absolute inset-0 flex flex-col items-center justify-center text-center p-6 cursor-pointer hover:bg-zinc-900/35 transition">
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={handleImageUpload}
+                        className="sr-only"
                       />
-                      <div className="space-y-2.5 text-center">
-                        <div className="mx-auto w-11 h-11 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center transition group-hover:scale-110 group-hover:border-red-500/20">
-                          <Layers className="w-4.5 h-4.5 text-zinc-400 group-hover:text-red-400" />
-                        </div>
-                        <div>
-                          <p className="text-xs font-semibold text-zinc-300">
-                            Bilder hochladen (Mehrfachauswahl)
-                          </p>
-                          <p className="text-[10px] text-zinc-500 max-w-xs leading-normal mt-0.5 px-3">
-                            Ziehe Bilder her oder klicke, um direkt <strong>mehrere Bilder</strong> hochzuladen und gemeinsam einzulesen.
-                          </p>
-                        </div>
+                      <div className="w-14 h-14 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center mb-4">
+                        <Plus className="w-5 h-5 text-red-400" />
                       </div>
+                      <p className="text-sm font-bold text-zinc-200">Foto auswählen</p>
+                      <p className="text-[11px] text-zinc-500 mt-1 max-w-[220px] leading-relaxed">
+                        Eine einzelne Karte, möglichst gerade und gut beleuchtet.
+                      </p>
                     </label>
                   )}
                 </div>
 
-                <div className="space-y-3">
-                  {/* Action Buttons Zone */}
+                <div className="grid grid-cols-2 gap-2">
                   {isCameraActive ? (
-                    <div className="flex gap-2">
+                    <>
                       <button
                         onClick={captureSnapshot}
-                        className="flex-1 bg-red-650 hover:bg-red-600 text-white font-bold py-2.5 px-4 rounded-xl text-xs uppercase tracking-wider font-display transition duration-150 cursor-pointer flex items-center justify-center gap-2 shadow-lg"
+                        className="bg-red-650 hover:bg-red-600 text-white font-bold py-2.5 px-3 rounded-xl text-xs uppercase tracking-wider font-display transition cursor-pointer flex items-center justify-center gap-2"
                       >
                         <Camera className="w-3.5 h-3.5" />
-                        Aufnehmen & Scannen
+                        Scannen
                       </button>
                       <button
                         onClick={stopCamera}
-                        className="bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-bold py-2.5 px-4 rounded-xl text-xs transition uppercase font-display cursor-pointer"
+                        className="bg-zinc-900 hover:bg-zinc-800 text-zinc-300 font-bold py-2.5 px-3 rounded-xl text-xs uppercase font-display transition cursor-pointer"
                       >
                         Schließen
                       </button>
-                    </div>
+                    </>
                   ) : (
-                    <div className="flex gap-2">
+                    <>
                       <button
                         onClick={startCamera}
-                        className="flex-1 bg-[#1a1c1e] hover:bg-[#25282c] text-zinc-150 font-bold py-2.5 px-4 rounded-xl text-xs border border-zinc-800 hover:border-zinc-700 transition duration-150 cursor-pointer flex items-center justify-center gap-2"
+                        className="bg-zinc-900 hover:bg-zinc-800 text-zinc-200 font-bold py-2.5 px-3 rounded-xl text-xs border border-zinc-800 transition cursor-pointer flex items-center justify-center gap-2"
                       >
                         <Camera className="w-3.5 h-3.5 text-red-500" />
-                        Kamera aktivieren
+                        Kamera
                       </button>
-                      {scannedImages.length > 0 && (
-                        <button
-                          onClick={() => {
-                            if (scannedImages[activeImageIndex]) {
-                              handleScanCardImage(scannedImages[activeImageIndex]);
-                            }
-                          }}
-                          className="flex-1 bg-red-650 hover:bg-red-600 text-white font-bold py-2.5 px-4 rounded-xl text-xs uppercase tracking-wider font-display transition duration-150 shadow-lg cursor-pointer flex items-center justify-center gap-2"
-                        >
-                          <Sparkles className="w-3.5 h-3.5" />
-                          Bild analysieren
-                        </button>
-                      )}
-                    </div>
+                      <label className="bg-zinc-900 hover:bg-zinc-800 text-zinc-200 font-bold py-2.5 px-3 rounded-xl text-xs border border-zinc-800 transition cursor-pointer flex items-center justify-center gap-2">
+                        <input type="file" accept="image/*" onChange={handleImageUpload} className="sr-only" />
+                        <Layers className="w-3.5 h-3.5 text-red-500" />
+                        Upload
+                      </label>
+                    </>
                   )}
                 </div>
 
-                {/* Latency and Speed Optimization Panel */}
-                <div className="bg-[#121214] border border-[#222226]/80 p-4 rounded-xl space-y-3 shadow-inner">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] uppercase font-bold font-mono text-amber-500 tracking-wider flex items-center gap-1.5">
-                      <Zap className="w-3.5 h-3.5 fill-amber-500 text-amber-600 animate-pulse" />
-                      Lokaler OCR-Scanner
-                    </span>
-                    <span className="text-[8.5px] font-mono font-bold text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/15">
-                      AKTIV ✓
-                    </span>
+                {scanImage && !isCameraActive && (
+                  <button
+                    onClick={() => handleScanCardImage(scanImage)}
+                    disabled={scanLoading}
+                    className="w-full bg-red-650 hover:bg-red-600 disabled:bg-zinc-800 disabled:text-zinc-500 text-white font-bold py-3 rounded-xl text-xs uppercase tracking-wider font-display transition cursor-pointer flex items-center justify-center gap-2"
+                  >
+                    <Sparkles className={`w-4 h-4 ${scanLoading ? "animate-spin" : ""}`} />
+                    {scanLoading ? "Analysiere..." : "Diese Karte erkennen"}
+                  </button>
+                )}
+
+                {scanLoading && (
+                  <div className="bg-zinc-950 border border-zinc-850 rounded-xl p-3 text-[11px] text-zinc-400 font-mono">
+                    {scanProgress || "Scanne Karte..."}
                   </div>
-                  
-                  <div className="space-y-2.5 text-[11px] text-zinc-400">
-                    <div className="space-y-1.5">
-                      <label className="text-[9px] font-mono font-bold text-zinc-500 uppercase tracking-wider">
-                        Optionaler OCR-Hinweis
-                      </label>
-                      <input
-                        value={manualScanHint}
-                        onChange={(e) => setManualScanHint(e.target.value)}
-                        placeholder="z.B. SV8a 123/187 ¥1980 oder OP05-119"
-                        className="w-full bg-zinc-950 border border-zinc-850 rounded-lg px-2.5 py-2 text-[11px] text-zinc-200 focus:outline-none focus:border-red-500/40 font-mono"
+                )}
+
+                {scanError && (
+                  <div className="bg-red-500/5 border border-red-500/15 rounded-xl p-3 text-xs text-red-300 leading-relaxed">
+                    {scanError}
+                  </div>
+                )}
+
+                {scanResult?.matched_cards?.length > 0 && (
+                  <div className="bg-emerald-500/5 border border-emerald-500/15 rounded-xl p-3 flex items-center gap-3">
+                    {pickBestScanCard(scanResult.matched_cards)?.image_small && (
+                      <img
+                        src={pickBestScanCard(scanResult.matched_cards)?.image_small}
+                        alt="Treffer"
+                        className="w-10 h-14 object-contain rounded bg-black/40 border border-zinc-800"
                       />
-                      <p className="text-[9px] text-zinc-600 leading-normal">
-                        Hilft im Shop bei unscharfen Regalfotos: Set-Code, Kartennummer oder Yen-Preis werden zusammen mit lokaler OCR an die Datenbank geschickt.
+                    )}
+                    <div className="min-w-0">
+                      <p className="text-xs font-bold text-zinc-100 truncate">
+                        {pickBestScanCard(scanResult.matched_cards)?.local_name || pickBestScanCard(scanResult.matched_cards)?.english_name}
                       </p>
-                    </div>
-                    <label className="flex items-start gap-2.5 cursor-pointer hover:text-zinc-200 transition select-none">
-                      <input 
-                        type="checkbox"
-                        checked={turboScan}
-                        onChange={(e) => setTurboScan(e.target.checked)}
-                        className="mt-0.5 rounded border-zinc-700 bg-zinc-900 text-red-600 focus:ring-red-500 focus:ring-offset-zinc-900"
-                      />
-                      <div>
-                        <div className="font-semibold text-zinc-200 text-xs">Pre-Processing (OCR-lesbar, max. 1024px)</div>
-                        <p className="text-[10px] text-zinc-500 leading-normal">
-                          Skaliert Bilder lokal, behält aber Kartennummer und Set-Code lesbar. Keine Cloud-KI, kein Bild-Prompting.
-                        </p>
-                      </div>
-                    </label>
-
-                    <label className="flex items-start gap-2.5 cursor-pointer hover:text-zinc-200 transition select-none">
-                      <input 
-                        type="checkbox"
-                        checked={grayscaleScan}
-                        onChange={(e) => setGrayscaleScan(e.target.checked)}
-                        className="mt-0.5 rounded border-zinc-700 bg-zinc-900 text-red-600 focus:ring-red-500 focus:ring-offset-zinc-900"
-                      />
-                      <div>
-                        <div className="font-semibold text-zinc-200 text-xs">Grayscale & Kontrast-Filter</div>
-                        <p className="text-[10px] text-zinc-500 leading-normal">
-                          Konvertiert Bilder in Graustufen und erhöht den Kontrast. Dadurch sinkt Bildrauschen und die lokale OCR erkennt Ziffern/Set-Codes stabiler.
-                        </p>
-                      </div>
-                    </label>
-
-                    <div className="pt-2 border-t border-zinc-800 text-[9px] font-mono text-zinc-500 leading-relaxed flex items-center gap-1">
-                      <span className="text-amber-500">⚡</span> Lokal aktiv: OCR → Set/Nummer/Yen → SQLite-Match.
-                    </div>
-                  </div>
-                </div>
-
-                {/* Local OCR raw detections list */}
-                {scanResult?.ai_identifications && scanResult.ai_identifications.length > 0 && (
-                  <div className="bg-[#09090b] border border-zinc-850 rounded-xl p-3 space-y-2">
-                    <h4 className="text-[10px] uppercase font-bold font-mono text-zinc-500 tracking-wider">
-                      Erkannte Rohdaten ({scanResult.ai_identifications.length} Karten)
-                    </h4>
-                    <div className="max-h-[140px] overflow-y-auto space-y-1.5 pr-1 divide-y divide-zinc-900">
-                      {scanResult.ai_identifications.map((ai: any, idx: number) => (
-                        <div key={idx} className="text-[11px] pt-1.5 flex flex-col gap-1">
-                          <div className="flex items-center justify-between">
-                            <span className="text-zinc-300 truncate font-semibold pr-1 max-w-[150px] flex items-center gap-1.5">
-                              {ai.pokemon_name}
-                              {ai.overlap_detected && (
-                                <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse mt-0.5" title="Überlappende Karte!" />
-                              )}
-                            </span>
-                            <div className="flex items-center gap-1.5 shrink-0 font-mono text-[10px]">
-                              <span className="text-zinc-500 bg-zinc-900 border border-zinc-850 px-1 py-0.2 rounded">
-                                N° {ai.card_number}
-                              </span>
-                              <span className="text-red-400 bg-red-500/5 px-1 py-0.2 border border-red-550/10 rounded font-bold uppercase font-mono">
-                                {ai.language}
-                              </span>
-                              <span className="text-emerald-400 font-bold bg-emerald-500/5 px-1 py-0.2 border border-emerald-500/10 rounded font-mono">
-                                {ai.similarity_score || Math.round(ai.confidence * 100)}% Match
-                              </span>
-                            </div>
-                          </div>
-                          {ai.overlap_detected && (
-                            <span className="text-[9px] text-amber-400 font-mono bg-amber-950/10 px-1 border border-amber-500/10 rounded self-start mt-0.5">
-                              ⚠️ Überlappt mit {ai.overlapping_card_names?.join(", ")}
-                            </span>
-                          )}
-                        </div>
-                      ))}
+                      <p className="text-[10px] text-zinc-500 font-mono">
+                        N° {pickBestScanCard(scanResult.matched_cards)?.card_number} · {pickBestScanCard(scanResult.matched_cards)?.set_code} · {pickBestScanCard(scanResult.matched_cards)?.similarity_score || Math.round((pickBestScanCard(scanResult.matched_cards)?.ai_confidence || 0) * 100)}%
+                      </p>
                     </div>
                   </div>
                 )}
@@ -5167,7 +5141,7 @@ export default function App() {
                 <div className="w-full">
                   <h3 className="text-xs font-bold font-display text-zinc-400 mb-4 flex items-center gap-2 uppercase tracking-wider">
                     <Sparkles className="w-3.5 h-3.5 text-zinc-500 animate-pulse" />
-                    2. Match Card Stapel
+                    Swipe-Stapel
                   </h3>
 
                   {scanLoading ? (
@@ -5182,7 +5156,7 @@ export default function App() {
                           {scanProgress || "Identifiziere alle Karten..."}
                         </p>
                         <p className="text-[10px] text-zinc-500 max-w-xs leading-normal animate-pulse">
-                          Lokale OCR liest Set-Code, Kartennummer und Yen-Preis; der Server gleicht nur gegen SQLite ab.
+                          Die App sucht den besten lokalen Treffer und legt genau eine Karte in den Stapel.
                         </p>
                       </div>
                     </div>
@@ -5468,7 +5442,7 @@ export default function App() {
                       <Layers className="w-9 h-9 text-zinc-700 mb-3" />
                       <p className="text-xs font-semibold text-zinc-400">Keine Karten im Stapel</p>
                       <p className="text-[10px] max-w-xs mt-1 leading-normal px-6">
-                        Sobald du links ein Bild hochlädst oder fotografierst, analysiert unsere KI die Karten und füllt diesen tinderartigen Swipe-Stapel automatisch.
+                        Sobald du links eine Karte scannst, landet der beste Treffer hier im Swipe-Stapel.
                       </p>
                     </div>
                   )}
@@ -5481,7 +5455,7 @@ export default function App() {
                   <div className="flex items-center justify-between border-b border-zinc-850 pb-3 mb-4">
                     <h3 className="text-xs font-bold font-display text-zinc-300 flex items-center gap-2 uppercase tracking-wider">
                       <ShoppingBag className="w-4 h-4 text-emerald-500" />
-                      3. Warenkorb ({swipeCart.length})
+                      Warenkorb ({swipeCart.length})
                     </h3>
                     
                     {swipeCart.length > 0 && (

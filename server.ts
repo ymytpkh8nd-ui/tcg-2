@@ -2699,6 +2699,95 @@ type PricingOptions = {
   manual_market_price_eur?: number;
 };
 
+const TRUSTED_MARKET_PRICE_SOURCES = new Set([
+  "manual",
+  "cardmarket",
+  "cardmarket_api",
+  "cardmarket_csv",
+  "cardmarket_export",
+  "ebay_sold",
+  "ebay_sold_csv",
+  "tcgplayer",
+  "pricecharting"
+]);
+
+const PRINTED_POKEMON_SET_CODE_ALIASES: Record<string, string> = {
+  SVI: "sv01",
+  PAL: "sv02",
+  OBF: "sv03",
+  MEW: "sv03.5",
+  PAR: "sv04",
+  PAF: "sv04.5",
+  TEF: "sv05",
+  TWM: "sv06",
+  SFA: "sv06.5",
+  SCR: "sv07",
+  SSP: "sv08",
+  PRE: "sv08.5",
+  JTG: "sv09",
+  DRI: "sv10",
+  BLK: "sv10.5b",
+  WHT: "sv10.5w"
+};
+
+const MARKET_PRICE_FRESH_DAYS = 14;
+const MARKET_PRICE_STALE_DAYS = 45;
+
+function normalizeMarketSource(source: any): string {
+  return String(source || "manual").trim().toLowerCase().replace(/\s+/g, "_");
+}
+
+function positiveMoney(value: any): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0;
+}
+
+function observedAgeDays(observedAt: any): number | null {
+  if (!observedAt) return null;
+  const ts = new Date(String(observedAt)).getTime();
+  if (!Number.isFinite(ts)) return null;
+  return Math.max(0, (Date.now() - ts) / 86400000);
+}
+
+function isTrustedMarketSource(source: any): boolean {
+  const clean = normalizeMarketSource(source);
+  return TRUSTED_MARKET_PRICE_SOURCES.has(clean) && !clean.includes("model") && !clean.includes("fallback");
+}
+
+function marketPriority(source: any): number {
+  const clean = normalizeMarketSource(source);
+  if (clean === "cardmarket_api" || clean === "cardmarket") return 0;
+  if (clean === "cardmarket_csv" || clean === "cardmarket_export") return 1;
+  if (clean === "manual") return 2;
+  if (clean === "ebay_sold" || clean === "ebay_sold_csv") return 3;
+  if (TRUSTED_MARKET_PRICE_SOURCES.has(clean)) return 4;
+  return 99;
+}
+
+function selectBestMarketPrice(rows: any[] = []) {
+  return rows
+    .filter(row => positiveMoney(row?.market_price_eur) > 0 && isTrustedMarketSource(row?.source))
+    .sort((a, b) => {
+      const pa = marketPriority(a.source);
+      const pb = marketPriority(b.source);
+      if (pa !== pb) return pa - pb;
+      return String(b.observed_at || "").localeCompare(String(a.observed_at || ""));
+    })[0] || null;
+}
+
+function buildManualMarketOverride(value: any) {
+  const price = positiveMoney(value);
+  if (!price) return null;
+  return {
+    market_price_eur: price,
+    low_price_eur: 0,
+    trend_price_eur: 0,
+    source: "manual",
+    observed_at: new Date().toISOString(),
+    notes: "Preis aus Request/Frontend manuell gesetzt."
+  };
+}
+
 function getBackendEstimatedPrices(card: any, game: string) {
   // Transparent local model used only when no manual/imported market price exists.
   // It is intentionally conservative and no longer pretends to be Cardmarket data.
@@ -2720,8 +2809,9 @@ function getBackendEstimatedPrices(card: any, game: string) {
     psa8: Math.round(rawPrice * 1.45 * 100) / 100,
     psa9: Math.round(rawPrice * 2.25 * 100) / 100,
     psa10: Math.round(rawPrice * (score >= 80 ? 7.5 : 4.5) * 100) / 100,
-    source: "local_model",
-    confidence: "low_without_manual_market_price"
+    source: "local_model_reference",
+    confidence: "not_a_market_price",
+    is_market_price: false
   };
 }
 
@@ -2732,23 +2822,48 @@ function calculateDealAnalysis(card: any, options: PricingOptions = {}, marketOv
   const customsFee = Number(options.customs_fee_eur ?? 0.35);
   const platformFee = Number(options.platform_fee_percent ?? 12);
   const targetMargin = Number(options.target_margin_percent ?? 30);
-  const manualMarket = Number(options.manual_market_price_eur || marketOverride?.market_price_eur || 0);
+  const requestManualMarket = buildManualMarketOverride(options.manual_market_price_eur);
+  const selectedMarket = requestManualMarket || (marketOverride && isTrustedMarketSource(marketOverride.source) ? marketOverride : null);
+  const marketPriceEur = positiveMoney(selectedMarket?.market_price_eur);
+  const marketAgeDays = observedAgeDays(selectedMarket?.observed_at);
+  const priceIsStale = marketPriceEur > 0 && marketAgeDays !== null && marketAgeDays > MARKET_PRICE_FRESH_DAYS;
+  const priceIsExpired = marketPriceEur > 0 && marketAgeDays !== null && marketAgeDays > MARKET_PRICE_STALE_DAYS;
   const localModel = getBackendEstimatedPrices(card, String(card?.game || "pokemon"));
-  const marketPriceEur = manualMarket > 0 ? manualMarket : localModel.raw;
   const grossCostEur = yenPrice > 0 ? yenPrice / exchangeRate : 0;
   const landedCostEur = grossCostEur > 0 ? grossCostEur * (1 + importVat / 100) + customsFee : 0;
   const netRevenueEur = marketPriceEur * (1 - platformFee / 100);
   const profitEur = landedCostEur > 0 ? netRevenueEur - landedCostEur : 0;
   const roiPercent = landedCostEur > 0 ? (profitEur / landedCostEur) * 100 : 0;
-  const requiredCostEur = (netRevenueEur / (1 + targetMargin / 100));
-  const maxBuyYen = Math.max(0, Math.floor(((requiredCostEur - customsFee) / (1 + importVat / 100)) * exchangeRate));
+  const requiredCostEur = marketPriceEur > 0 ? (netRevenueEur / (1 + targetMargin / 100)) : 0;
+  const maxBuyYen = marketPriceEur > 0 ? Math.max(0, Math.floor(((requiredCostEur - customsFee) / (1 + importVat / 100)) * exchangeRate)) : 0;
   let decision: "BUY" | "CHECK" | "SKIP" = "CHECK";
-  if (yenPrice > 0 && yenPrice <= maxBuyYen && profitEur >= Math.max(3, marketPriceEur * 0.12)) decision = "BUY";
-  if (yenPrice > 0 && (yenPrice > maxBuyYen || profitEur < 1)) decision = "SKIP";
+  let decisionReason = "market_price_missing";
+  if (marketPriceEur > 0) {
+    decisionReason = priceIsExpired
+      ? "market_price_expired"
+      : priceIsStale
+        ? "market_price_stale_recheck_required"
+        : "trusted_market_price";
+    if (!priceIsStale && !priceIsExpired && yenPrice > 0 && yenPrice <= maxBuyYen && profitEur >= Math.max(3, marketPriceEur * 0.12)) {
+      decision = "BUY";
+      decisionReason = "margin_target_met";
+    }
+    if (yenPrice > 0 && (yenPrice > maxBuyYen || profitEur < 1)) {
+      decision = "SKIP";
+      decisionReason = "margin_target_missed";
+    }
+  }
+
   return {
     market_price_eur: Math.round(marketPriceEur * 100) / 100,
-    market_source: manualMarket > 0 ? (marketOverride?.source || "manual") : "local_model_fallback",
-    market_confidence: manualMarket > 0 ? "manual/high" : "model/low",
+    market_source: selectedMarket?.source || "missing_market_price",
+    market_confidence: marketPriceEur > 0
+      ? (priceIsExpired ? "expired" : priceIsStale ? "stale" : "trusted")
+      : "missing",
+    market_observed_at: selectedMarket?.observed_at || null,
+    market_age_days: marketAgeDays === null ? null : Math.round(marketAgeDays * 10) / 10,
+    market_price_required: marketPriceEur <= 0,
+    can_calculate_deal: marketPriceEur > 0 && !priceIsExpired,
     yen_price: yenPrice,
     exchange_rate: exchangeRate,
     landed_cost_eur: Math.round(landedCostEur * 100) / 100,
@@ -2757,6 +2872,8 @@ function calculateDealAnalysis(card: any, options: PricingOptions = {}, marketOv
     roi_percent: Math.round(roiPercent * 10) / 10,
     max_buy_yen: maxBuyYen,
     decision,
+    decision_reason: decisionReason,
+    reference_model: localModel,
     assumptions: {
       import_vat_percent: importVat,
       customs_fee_eur: customsFee,
@@ -2772,16 +2889,18 @@ app.get("/api/cards/:api_card_id/pricing", async (req, res) => {
     const game = String(req.query.game || "pokemon").toLowerCase();
     const card = await dbGet("SELECT * FROM cards WHERE api_card_id = ? AND game = ? LIMIT 1", [api_card_id, game]);
     if (!card) return res.status(404).json({ error: "Karte nicht gefunden." });
-    const market = await dbGet("SELECT * FROM market_prices WHERE api_card_id = ? AND game = ? ORDER BY observed_at DESC LIMIT 1", [api_card_id, game]);
+    const marketRows = await dbAll("SELECT * FROM market_prices WHERE api_card_id = ? AND game = ? ORDER BY observed_at DESC", [api_card_id, game]);
+    const market = selectBestMarketPrice(marketRows);
     const analysis = calculateDealAnalysis(card, {
       yen_price: Number(req.query.yen_price || 0),
       exchange_rate: Number(req.query.exchange_rate || 165),
       import_vat_percent: Number(req.query.import_vat_percent || 19),
       customs_fee_eur: Number(req.query.customs_fee_eur || 0.35),
       platform_fee_percent: Number(req.query.platform_fee_percent || 12),
-      target_margin_percent: Number(req.query.target_margin_percent || 30)
+      target_margin_percent: Number(req.query.target_margin_percent || 30),
+      manual_market_price_eur: Number(req.query.manual_market_price_eur || 0)
     }, market);
-    res.json({ success: true, card: enrichCard(card), market_price: market || null, analysis });
+    res.json({ success: true, card: enrichCard(card), market_price: market || null, market_prices: marketRows, analysis });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -2790,7 +2909,13 @@ app.get("/api/cards/:api_card_id/pricing", async (req, res) => {
 app.post("/api/prices/upsert", async (req, res) => {
   try {
     const { api_card_id, game = "pokemon", market_price_eur, low_price_eur = 0, trend_price_eur = 0, source = "manual", source_url = "", notes = "" } = req.body || {};
-    if (!api_card_id || !Number(market_price_eur)) return res.status(400).json({ error: "api_card_id und market_price_eur sind erforderlich." });
+    const cleanSource = normalizeMarketSource(source);
+    const marketPrice = positiveMoney(market_price_eur);
+    const lowPrice = positiveMoney(low_price_eur);
+    const trendPrice = positiveMoney(trend_price_eur);
+    if (!api_card_id || !marketPrice) return res.status(400).json({ error: "api_card_id und ein positiver market_price_eur sind erforderlich." });
+    if (!isTrustedMarketSource(cleanSource)) return res.status(400).json({ error: "source muss eine echte Preisquelle sein, z.B. manual, cardmarket_csv, cardmarket_api oder ebay_sold. Modell-/Fallback-Preise werden nicht gespeichert." });
+    if (marketPrice > 100000) return res.status(400).json({ error: "market_price_eur wirkt unplausibel hoch und wurde abgelehnt." });
     await dbRun(`
       INSERT INTO market_prices (api_card_id, game, market_price_eur, low_price_eur, trend_price_eur, source, source_url, observed_at, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
@@ -2801,8 +2926,8 @@ app.post("/api/prices/upsert", async (req, res) => {
         source_url = excluded.source_url,
         observed_at = CURRENT_TIMESTAMP,
         notes = excluded.notes;
-    `, [api_card_id, String(game).toLowerCase(), Number(market_price_eur), Number(low_price_eur || 0), Number(trend_price_eur || 0), source, source_url, notes]);
-    const row = await dbGet("SELECT * FROM market_prices WHERE api_card_id = ? AND game = ? AND source = ?", [api_card_id, String(game).toLowerCase(), source]);
+    `, [api_card_id, String(game).toLowerCase(), marketPrice, lowPrice, trendPrice, cleanSource, source_url, notes]);
+    const row = await dbGet("SELECT * FROM market_prices WHERE api_card_id = ? AND game = ? AND source = ?", [api_card_id, String(game).toLowerCase(), cleanSource]);
     res.json({ success: true, price: row });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -2853,19 +2978,59 @@ app.get("/api/sets", async (req, res) => {
         [s.set_code, s.language, game]
       );
 
-      // Replicate pricing algorithm
+      const marketRows = setCards.length > 0
+        ? await dbAll(
+            `SELECT * FROM market_prices WHERE game = ? AND api_card_id IN (${setCards.map(() => "?").join(",")})`,
+            [game, ...setCards.map((c: any) => c.api_card_id)]
+          )
+        : [];
+      const marketByCardId = new Map<string, any[]>();
+      for (const row of marketRows) {
+        const key = String(row.api_card_id || "");
+        const list = marketByCardId.get(key) || [];
+        list.push(row);
+        marketByCardId.set(key, list);
+      }
+
       const cardPrices = setCards.map(c => {
-        const prices = getBackendEstimatedPrices(c, String(game));
+        const market = selectBestMarketPrice(marketByCardId.get(String(c.api_card_id || "")) || []);
+        const reference = getBackendEstimatedPrices(c, String(game));
+        const marketRaw = positiveMoney(market?.market_price_eur);
+        const prices = marketRaw > 0
+          ? {
+              raw: marketRaw,
+              psa8: 0,
+              psa9: 0,
+              psa10: 0,
+              source: market.source,
+              confidence: "trusted",
+              observed_at: market.observed_at,
+              is_market_price: true
+            }
+          : {
+              raw: 0,
+              psa8: 0,
+              psa9: 0,
+              psa10: 0,
+              source: "missing_market_price",
+              confidence: "missing",
+              is_market_price: false,
+              reference_model: reference
+            };
         return {
           card: c,
           prices
         };
       });
 
-      // Sort by RAW price descending
+      const pricedCardPrices = cardPrices.filter(cp => cp.prices.raw > 0);
+
       cardPrices.sort((a, b) => b.prices.raw - a.prices.raw);
 
-      const top5 = cardPrices.slice(0, 5).map(cp => ({
+      const top5 = pricedCardPrices
+        .sort((a, b) => b.prices.raw - a.prices.raw)
+        .slice(0, 5)
+        .map(cp => ({
         id: cp.card.id,
         api_card_id: cp.card.api_card_id,
         english_name: cp.card.english_name,
@@ -2878,13 +3043,13 @@ app.get("/api/sets", async (req, res) => {
         prices: cp.prices
       }));
 
-      const totalValueRaw = cardPrices.reduce((sum, cp) => sum + cp.prices.raw, 0);
-      const avgPriceRaw = cardPrices.length > 0 ? totalValueRaw / cardPrices.length : 0;
-      const highestPriceRaw = cardPrices.length > 0 ? cardPrices[0].prices.raw : 0;
+      const totalValueRaw = pricedCardPrices.reduce((sum, cp) => sum + cp.prices.raw, 0);
+      const avgPriceRaw = pricedCardPrices.length > 0 ? totalValueRaw / pricedCardPrices.length : 0;
+      const highestPriceRaw = pricedCardPrices.length > 0 ? Math.max(...pricedCardPrices.map(cp => cp.prices.raw)) : 0;
 
-      const totalValuePsa10 = cardPrices.reduce((sum, cp) => sum + cp.prices.psa10, 0);
-      const avgPricePsa10 = cardPrices.length > 0 ? totalValuePsa10 / cardPrices.length : 0;
-      const highestPricePsa10 = cardPrices.length > 0 ? cardPrices[0].prices.psa10 : 0;
+      const totalValuePsa10 = 0;
+      const avgPricePsa10 = 0;
+      const highestPricePsa10 = 0;
 
       enrichedRows.push({
         ...s,
@@ -2892,12 +3057,15 @@ app.get("/api/sets", async (req, res) => {
         german_set_name: germanSetName || "",
         stats: {
           total_cards_db: setCards.length,
+          priced_cards_db: pricedCardPrices.length,
           total_value_raw: totalValueRaw,
           average_price_raw: avgPriceRaw,
           highest_price_raw: highestPriceRaw,
           total_value_psa10: totalValuePsa10,
           average_price_psa10: avgPricePsa10,
           highest_price_psa10: highestPricePsa10,
+          price_source: pricedCardPrices.length > 0 ? "market_prices" : "missing_market_prices",
+          price_confidence: pricedCardPrices.length > 0 ? "trusted/imported_or_manual" : "missing"
         },
         top_5_cards: top5
       });
@@ -3576,6 +3744,105 @@ function uniqueStrings(values: string[]): string[] {
   return out;
 }
 
+function normalizeCardNumberToken(value: any): string {
+  return String(value || "")
+    .replace(/\s+/g, "")
+    .replace(/[OoQ]/g, "0")
+    .replace(/[Il|](?=\d)/g, "1")
+    .toUpperCase();
+}
+
+function cardNumberVariants(value: any): string[] {
+  const clean = normalizeCardNumberToken(value);
+  if (!clean) return [];
+  const values = [clean];
+  if (clean.includes("/")) values.push(clean.split("/")[0]);
+  const first = clean.split("/")[0];
+  if (/^\d{1,3}$/.test(first)) {
+    const n = parseInt(first, 10);
+    if (!Number.isNaN(n)) {
+      values.push(String(n));
+      values.push(String(n).padStart(3, "0"));
+    }
+  }
+  return uniqueStrings(values);
+}
+
+function cardNumberSqlCondition(alias = "cards") {
+  return `(
+    UPPER(${alias}.card_number) = ?
+    OR UPPER(${alias}.card_number) LIKE ?
+    OR UPPER(${alias}.card_number) LIKE ?
+  )`;
+}
+
+function cardNumberSqlParams(num: string) {
+  const clean = normalizeCardNumberToken(num);
+  return [clean, `${clean}/%`, `%/${clean}`];
+}
+
+function extractStandaloneCardNumbers(value: string): string[] {
+  const out: string[] = [];
+  const rx = /(^|[^0-9/])(\d{1,3})(?!\s*\/|[0-9])/g;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(value || "")) !== null) {
+    out.push(m[2]);
+  }
+  return out;
+}
+
+function normalizeSetCodeToken(value: any): string {
+  return String(value || "")
+    .replace(/\s+/g, "")
+    .replace(/[＿－ー–—]/g, "-")
+    .toUpperCase();
+}
+
+function normalizeInternalSetCode(value: any): string {
+  const clean = normalizeSetCodeToken(value);
+  return PRINTED_POKEMON_SET_CODE_ALIASES[clean] || clean;
+}
+
+function extractPrintedPokemonSetAliases(value: string): string[] {
+  const text = normalizeScanText(value || "").toUpperCase();
+  const aliases = Object.keys(PRINTED_POKEMON_SET_CODE_ALIASES).join("|");
+  const out: string[] = [];
+  const rx = new RegExp(`\\b(${aliases})\\s*(?:EN|DE|FR|IT|ES|PT)?\\b`, "gi");
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(text)) !== null) {
+    out.push(PRINTED_POKEMON_SET_CODE_ALIASES[String(m[1]).toUpperCase()]);
+  }
+  return out;
+}
+
+function looksLikeJapanesePokemonScan(parsed: any): boolean {
+  const text = String(parsed?.text || "");
+  return /[ぁ-んァ-ン一-龯]/.test(text) || String(parsed?.language || "").toUpperCase() === "JA";
+}
+
+function rowMatchesScanName(row: any, names: string[]): boolean {
+  const haystack = [
+    row?.pokemon_name,
+    row?.english_name,
+    row?.local_name,
+    row?.japanese_name
+  ].filter(Boolean).join(" ").toLowerCase();
+  return names.some(name => {
+    const clean = String(name || "").toLowerCase().trim();
+    return clean.length >= 3 && haystack.includes(clean);
+  });
+}
+
+function scanMatchConfidence(reason: string, parsed: any, row: any): number {
+  const rowLang = String(row?.language || "").toUpperCase();
+  const desiredLang = String(parsed?.language || "").toUpperCase();
+  const langPenalty = desiredLang && rowLang && rowLang !== desiredLang ? 0.05 : 0;
+  if (reason === "set_number_exact") return 0.985 - langPenalty;
+  if (reason === "name_number_exact") return 0.92 - langPenalty;
+  if (reason === "filename_exact") return 0.98 - langPenalty;
+  return 0.0;
+}
+
 function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
   const joined = normalizeScanText([text, hints?.text, hints?.ocrText, hints?.filename].filter(Boolean).join(" "));
   const digitSafeJoined = normalizeOcrDigitText(joined);
@@ -3586,14 +3853,21 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
   const onePieceCodes = joined.match(/\b(?:OP|ST|EB|PR)[ -]?\d{1,2}\b/gi) || [];
   setCodes.push(...onePieceCodes.map(v => v.replace(/\s+/g, "").replace(/-/g, "").toUpperCase()));
 
-  const pokemonSetCodes = joined.match(/\b(?:SV-P|S-P|SM-P|SV|SM|S|XY|BW|DP|ADV|PCG)[ -]?\d{0,2}[A-Z]?\b/gi) || [];
+  const pokemonSetCodes = joined.match(/\b(?:SV-P|S-P|SM-P|SV[ -]?\d{1,2}[A-Z]?|SM[ -]?\d{1,2}[A-Z]?|S[ -]?\d{1,2}[A-Z]?|XY[ -]?\d{1,2}[A-Z]?|BW[ -]?\d{1,2}[A-Z]?|DP[ -]?\d{1,2}[A-Z]?|ADV[ -]?\d{1,2}[A-Z]?|PCG[ -]?\d{1,2}[A-Z]?)\b/gi) || [];
   setCodes.push(...pokemonSetCodes.map(v => v.replace(/\s+/g, "").toUpperCase()));
+  const tcgdexLikeSetCodes = joined.match(/\b(?:SV|SM|S|XY|BW|DP|ADV|PCG|ME|A|B)[ -]?\d{1,2}(?:\.\d+)?[A-Z]?\b/gi) || [];
+  setCodes.push(...tcgdexLikeSetCodes.map(v => v.replace(/\s+/g, "").toUpperCase()));
+  setCodes.push(...extractPrintedPokemonSetAliases(joined));
 
   const fractional = digitSafeJoined.match(/\b\d{1,3}\s*\/\s*\d{1,3}\b/g) || [];
   for (const num of fractional) {
     const clean = num.replace(/\s+/g, "");
     cardNumbers.push(clean);
     cardNumbers.push(clean.split("/")[0]);
+  }
+
+  if (setCodes.length > 0) {
+    cardNumbers.push(...extractStandaloneCardNumbers(joined));
   }
 
   const onePieceNumbers = joined.match(/\b(?:OP|ST|EB|PR)\d{2}[- ]?\d{3}\b/gi) || [];
@@ -3619,6 +3893,13 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
       if (!isNaN(n) && n >= 30 && n <= 300000) priceCandidates.push(n);
     }
   }
+  if (/price|preis|label|yen/i.test(String(hints?.zone || hints?.source || ""))) {
+    const plainPrices = digitSafeJoined.match(/\b\d{3,6}\b/g) || [];
+    for (const raw of plainPrices) {
+      const n = parseInt(raw, 10);
+      if (!isNaN(n) && n >= 100 && n <= 300000) priceCandidates.push(n);
+    }
+  }
   if (hints?.yen_price) {
     const n = parseInt(String(hints.yen_price), 10);
     if (!isNaN(n) && n > 0) priceCandidates.unshift(n);
@@ -3631,12 +3912,17 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
 
   return {
     text: joined,
-    set_codes: uniqueStrings(setCodes),
+    set_codes: uniqueStrings(setCodes.map(normalizeInternalSetCode)).filter(code => {
+      const clean = code.replace(/\s+/g, "").toUpperCase();
+      if (/^(SV|SM|S|XY|BW|DP|ADV|PCG)$/.test(clean)) return false;
+      if (/^(OP|ST|EB|PR)$/.test(clean)) return false;
+      return clean.length >= 2 && /\d|-P$/.test(clean);
+    }),
     card_numbers: uniqueStrings(cardNumbers),
     names: uniqueStrings(names),
     yen_price: priceCandidates.length ? priceCandidates[0] : 0,
     yellow_label_detected: yellowLabelDetected,
-    language: String(language || (game === "onepiece" ? "JA" : "EN")).toUpperCase()
+    language: String(language || "JA").toUpperCase()
   };
 }
 
@@ -3657,11 +3943,41 @@ function buildScanIdentification(raw: any, parsed: any, source: string, confiden
   };
 }
 
+app.get("/api/cards/visual-candidates", async (req, res) => {
+  try {
+    const game = String(req.query.game || "pokemon").toLowerCase();
+    const language = String(req.query.language || "").toUpperCase();
+    const limit = Math.max(50, Math.min(5000, Number(req.query.limit || 3000)));
+    const params: any[] = [game];
+    let query = `
+      SELECT id, api_card_id, english_name, local_name, pokemon_name, japanese_name, language,
+             set_name, set_code, card_number, rarity, supertype, subtype, hp, types,
+             evolves_from, regulation_mark, illustrator, release_date, image_small,
+             image_large, cardmarket_id, game
+      FROM cards
+      WHERE game = ?
+        AND COALESCE(image_small, image_large, '') != ''
+    `;
+    if (language) {
+      query += " AND UPPER(language) = ?";
+      params.push(language);
+    }
+    query += " ORDER BY id ASC LIMIT ?";
+    params.push(limit);
+
+    const rows = await dbAll(query, params);
+    res.json({ success: true, cards: rows.map(enrichCard), count: rows.length });
+  } catch (err: any) {
+    console.error("Failed to load visual candidates:", err);
+    res.status(500).json({ error: err.message || "Bildkandidaten konnten nicht geladen werden." });
+  }
+});
+
 async function findCardsByLocalHints(parsed: any, game = "pokemon"): Promise<any[]> {
   const results: any[] = [];
   const seen = new Set<string>();
-  const setCodes = parsed.set_codes || [];
-  const cardNumbers = parsed.card_numbers || [];
+  const setCodes = uniqueStrings((parsed.set_codes || []).map(normalizeInternalSetCode));
+  const cardNumbers = uniqueStrings((parsed.card_numbers || []).flatMap(cardNumberVariants));
   const lang = (parsed.language || "JA").toUpperCase();
   const ignoredWords = new Set(["BASIC", "STAGE", "TRAINER", "ENERGY", "POKEMON", "POKÉMON", "CARD", "CARDS", "LOCAL", "OCR", "FULL", "SOURCE", "BOTTOM", "NUMBER", "PRICE", "LOWER", "THIRD"]);
   const textWords = normalizeScanText(parsed.text || "")
@@ -3670,26 +3986,42 @@ async function findCardsByLocalHints(parsed: any, game = "pokemon"): Promise<any
     .slice(0, 18);
   const searchNames = uniqueStrings([...(parsed.names || []), ...textWords]).slice(0, 14);
 
-  const addRows = (rows: any[]) => {
+  const addRows = (rows: any[], reason: string) => {
     for (const row of rows || []) {
       const key = `${row.api_card_id || row.id}-${row.language}-${row.game || game}`;
       if (!seen.has(key)) {
         seen.add(key);
-        results.push(row);
+        results.push({ ...row, __scan_match_reason: reason });
       }
     }
   };
 
-  // Strongest signal for real card photos: printed name plus collector number.
-  // This still works when glare, sleeves, or price labels hide the set code.
-  for (const num of cardNumbers) {
-    const numClean = String(num).replace(/\s+/g, "").toUpperCase();
-    for (const name of searchNames) {
-      const pattern = `%${String(name).toLowerCase()}%`;
+  for (const setCode of setCodes) {
+    for (const num of cardNumbers) {
       const rows = await dbAll(`
         SELECT * FROM cards
         WHERE game = ?
-          AND (UPPER(card_number) = ? OR UPPER(card_number) LIKE ? OR UPPER(card_number) LIKE ? OR UPPER(card_number) LIKE ?)
+          AND UPPER(set_code) = ?
+          AND ${cardNumberSqlCondition("cards")}
+        ORDER BY
+          (CASE WHEN UPPER(language) = ? THEN 0 ELSE 1 END),
+          id ASC
+        LIMIT 4
+      `, [game, setCode, ...cardNumberSqlParams(num), lang]);
+      addRows(rows, "set_number_exact");
+    }
+  }
+  if (results.length > 0) return results.slice(0, 6);
+
+  // Name + number is acceptable only when the name actually matches card text.
+  // A raw collector number alone is far too ambiguous across Japanese/English sets.
+  for (const num of cardNumbers) {
+    for (const name of searchNames.filter(n => String(n).length >= 3)) {
+      const pattern = `%${String(name).toLowerCase().trim()}%`;
+      const rows = await dbAll(`
+        SELECT * FROM cards
+        WHERE game = ?
+          AND ${cardNumberSqlCondition("cards")}
           AND (
             LOWER(pokemon_name) LIKE ?
             OR LOWER(english_name) LIKE ?
@@ -3701,62 +4033,11 @@ async function findCardsByLocalHints(parsed: any, game = "pokemon"): Promise<any
           (CASE WHEN LOWER(english_name) = LOWER(?) OR LOWER(local_name) = LOWER(?) OR LOWER(pokemon_name) = LOWER(?) THEN 0 ELSE 1 END),
           id ASC
         LIMIT 6
-      `, [game, numClean, `${numClean}/%`, `%/${numClean}`, `%${numClean}`, pattern, pattern, pattern, pattern, lang, String(name), String(name), String(name)]);
-      addRows(rows);
+      `, [game, ...cardNumberSqlParams(num), pattern, pattern, pattern, pattern, lang, String(name), String(name), String(name)]);
+      addRows(rows.filter((row: any) => rowMatchesScanName(row, [name])), "name_number_exact");
     }
   }
-  if (results.length > 0 && cardNumbers.length > 0 && searchNames.length > 0) {
-    return results.slice(0, 8);
-  }
-
-  for (const setCode of setCodes) {
-    for (const num of cardNumbers) {
-      const numClean = String(num).replace(/\s+/g, "");
-      const rows = await dbAll(`
-        SELECT * FROM cards
-        WHERE game = ?
-          AND (UPPER(set_code) = ? OR UPPER(set_code) LIKE ?)
-          AND (UPPER(card_number) = ? OR UPPER(card_number) LIKE ? OR UPPER(card_number) LIKE ?)
-        ORDER BY (CASE WHEN UPPER(language) = ? THEN 0 ELSE 1 END), id ASC
-        LIMIT 5
-      `, [game, String(setCode).toUpperCase(), `%${String(setCode).toUpperCase()}%`, numClean.toUpperCase(), `${numClean.toUpperCase()}/%`, `%${numClean.toUpperCase()}`, lang]);
-      addRows(rows);
-    }
-  }
-
-  for (const num of cardNumbers) {
-    const numClean = String(num).replace(/\s+/g, "");
-    const rows = await dbAll(`
-      SELECT * FROM cards
-      WHERE game = ?
-        AND (UPPER(card_number) = ? OR UPPER(card_number) LIKE ? OR UPPER(card_number) LIKE ?)
-      ORDER BY (CASE WHEN UPPER(language) = ? THEN 0 ELSE 1 END),
-               (CASE WHEN UPPER(set_code) IN (${setCodes.length ? setCodes.map(() => '?').join(',') : "''"}) THEN 0 ELSE 1 END),
-               id ASC
-      LIMIT 8
-    `, [game, numClean.toUpperCase(), `${numClean.toUpperCase()}/%`, `%${numClean.toUpperCase()}`, lang, ...setCodes.map((s: string) => String(s).toUpperCase())]);
-    addRows(rows);
-  }
-
-  if (setCodes.length > 0) {
-    for (const setCode of setCodes) {
-      for (const name of searchNames) {
-        const pattern = `%${String(name).toLowerCase()}%`;
-        const rows = await dbAll(`
-          SELECT * FROM cards
-          WHERE game = ?
-            AND (UPPER(set_code) = ? OR UPPER(set_code) LIKE ?)
-            AND (LOWER(pokemon_name) LIKE ? OR LOWER(english_name) LIKE ? OR LOWER(local_name) LIKE ? OR LOWER(japanese_name) LIKE ?)
-          ORDER BY (CASE WHEN UPPER(language) = ? THEN 0 ELSE 1 END), id ASC
-          LIMIT 3
-        `, [game, String(setCode).toUpperCase(), `%${String(setCode).toUpperCase()}%`, pattern, pattern, pattern, pattern, lang]);
-        addRows(rows);
-        if (results.length >= 8) break;
-      }
-    }
-  }
-
-  return results.slice(0, 12);
+  return results.slice(0, 6);
 }
 
 // POST endpoint to scan a card image and identify it in the database without Cloud-KI.
@@ -3767,6 +4048,14 @@ app.post("/api/cards/scan", async (req, res) => {
     const gameLower = String(game || "pokemon").toLowerCase();
 
     const parsed = parseLocalScanHints([filename, ocrText, JSON.stringify(hints || {})].join(" "), { ...hints, filename }, gameLower);
+    const segmentParseds = (Array.isArray(localDetections) ? localDetections : []).map((det: any) => ({
+      det,
+      parsed: parseLocalScanHints(det?.text || "", det, gameLower)
+    }));
+    if (!parsed.yen_price) {
+      const segmentPrice = segmentParseds.find(({ parsed: p }) => Number(p?.yen_price || 0) > 0)?.parsed?.yen_price || 0;
+      if (segmentPrice) parsed.yen_price = segmentPrice;
+    }
     const matchedCards: any[] = [];
     const identifications: any[] = [];
 
@@ -3791,14 +4080,14 @@ app.post("/api/cards/scan", async (req, res) => {
     for (const row of localMatches) {
       const key = `${row.api_card_id || row.id}-${row.language}`;
       if (!matchedCards.some(c => `${c.api_card_id || c.id}-${c.language}` === key)) {
-        const confidence = parsed.card_numbers?.length
-          ? (parsed.set_codes?.length ? 0.94 : (parsed.names?.length ? 0.9 : 0.84))
-          : 0.62;
-        const sourceLabel = parsed.set_codes?.length && parsed.card_numbers?.length
+        const reason = row.__scan_match_reason || "unknown";
+        const confidence = scanMatchConfidence(reason, parsed, row);
+        const sourceLabel = reason === "set_number_exact"
           ? "Lokaler OCR-Fastmatch: Set + Nummer"
-          : (parsed.names?.length && parsed.card_numbers?.length ? "Lokaler OCR-Fastmatch: Name + Nummer" : "Lokaler OCR/DB-Kandidatenmatch");
+          : "Lokaler OCR-Fastmatch: Name + Nummer";
+        const { __scan_match_reason, ...cleanRow } = row;
         matchedCards.push({
-          ...row,
+          ...cleanRow,
           yen_price: parsed.yen_price || null,
           yellow_label_detected: parsed.yellow_label_detected,
           bounding_box: { ymin: 80, xmin: 80, ymax: 920, xmax: 920 },
@@ -3813,27 +4102,41 @@ app.post("/api/cards/scan", async (req, res) => {
       }
     }
 
-    for (const det of Array.isArray(localDetections) ? localDetections : []) {
-      const detParsed = parseLocalScanHints(det?.text || "", det, gameLower);
+    for (const { det, parsed: detParsed } of segmentParseds) {
+      const hasSegmentNameAndNumber = (detParsed.names?.length || 0) > 0 && (detParsed.card_numbers?.length || 0) > 0;
+      const hasSegmentSetAndNumber = (detParsed.set_codes?.length || 0) > 0 && (detParsed.card_numbers?.length || 0) > 0;
+      if (!hasSegmentNameAndNumber && !hasSegmentSetAndNumber) {
+        continue;
+      }
       const rows = await findCardsByLocalHints(detParsed, gameLower);
       for (const row of rows.slice(0, 2)) {
         const key = `${row.api_card_id || row.id}-${row.language}`;
         if (!matchedCards.some(c => `${c.api_card_id || c.id}-${c.language}` === key)) {
+          const reason = row.__scan_match_reason || "unknown";
+          const confidence = Math.max(0.82, scanMatchConfidence(reason, detParsed, row) - 0.04);
+          const { __scan_match_reason, ...cleanRow } = row;
           matchedCards.push({
-            ...row,
+            ...cleanRow,
             yen_price: detParsed.yen_price || parsed.yen_price || null,
             yellow_label_detected: detParsed.yellow_label_detected || parsed.yellow_label_detected,
             bounding_box: det?.bounding_box || { ymin: 80, xmin: 80, ymax: 920, xmax: 920 },
-            ai_confidence: 0.8,
+            ai_confidence: confidence,
             ai_detected_language: row.language || detParsed.language,
-            similarity_score: 80,
-            hash_match_score: 80,
-            verification_status: "Lokaler Segment-OCR-Match",
+            similarity_score: Math.round(confidence * 100),
+            hash_match_score: Math.round(confidence * 100),
+            verification_status: reason === "set_number_exact" ? "Lokaler Segment-OCR-Match: Set + Nummer" : "Lokaler Segment-OCR-Match: Name + Nummer",
             scanner_source: "local_segment_ocr"
           });
-          identifications.push(buildScanIdentification(row, detParsed, "Lokaler Segment-OCR-Match", 0.8));
+          identifications.push(buildScanIdentification(row, detParsed, reason === "set_number_exact" ? "Lokaler Segment-OCR-Match: Set + Nummer" : "Lokaler Segment-OCR-Match: Name + Nummer", confidence));
         }
       }
+    }
+
+    const languageRows = await dbAll("SELECT language, COUNT(*) as count FROM cards WHERE game = ? GROUP BY language", [gameLower]);
+    const hasJapaneseInventory = languageRows.some((row: any) => String(row.language || "").toUpperCase() === "JA" && Number(row.count || 0) > 0);
+    const scanWarnings: string[] = [];
+    if (gameLower === "pokemon" && looksLikeJapanesePokemonScan(parsed) && !hasJapaneseInventory) {
+      scanWarnings.push("Die Pokémon-Datenbank enthält aktuell keine JA-Karten. Japanische Raw-Scans werden deshalb nur gemeldet, wenn Set/Nummer eindeutig in vorhandenen Daten existieren; unsichere EN-Fallbacks werden blockiert.");
     }
 
     return res.json({
@@ -3843,7 +4146,8 @@ app.post("/api/cards/scan", async (req, res) => {
       ai_identifications: identifications, // kept for old UI compatibility; source is local, not AI
       local_identifications: identifications,
       parsed_hints: parsed,
-      scanner_engine: "local-ocr-db-v2",
+      scan_warnings: scanWarnings,
+      scanner_engine: "local-ocr-db-v3-strict",
       message: matchedCards.length > 0
         ? `${matchedCards.length} lokale Treffer gefunden.`
         : "Kein sicherer lokaler Treffer. Bitte Set-Code/Kartennummer im Foto schärfer aufnehmen oder manuell suchen."
