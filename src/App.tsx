@@ -48,7 +48,11 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 
 declare global {
-  interface Window { Tesseract?: any; __tcgTesseractPromise?: Promise<any>; }
+  interface Window {
+    Tesseract?: any;
+    __tcgTesseractPromise?: Promise<any>;
+    __tcgOcrWorkerPromises?: Record<string, Promise<any | null>>;
+  }
 }
 
 // Types matching sqlite representation
@@ -698,6 +702,8 @@ export function SafeCardImage({
       onError={handleError}
       className={className}
       referrerPolicy="no-referrer"
+      loading="lazy"
+      decoding="async"
     />
   );
 }
@@ -1982,7 +1988,11 @@ export default function App() {
     setScanResult(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment" }
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1440 },
+          height: { ideal: 1920 }
+        }
       });
       setCameraStream(stream);
       setIsCameraActive(true);
@@ -2035,8 +2045,8 @@ export default function App() {
 
       // Local OCR still needs readable text. Turbo keeps images smaller, but never destroys card numbers.
       if (turboScan) {
-        maxWidth = 1024;
-        maxHeight = 1024;
+        maxWidth = 1400;
+        maxHeight = 1400;
       }
 
       const img = new Image();
@@ -2065,7 +2075,7 @@ export default function App() {
         if (ctx) {
           ctx.drawImage(img, 0, 0, width, height);
 
-          resolve(canvas.toDataURL("image/jpeg", 0.75));
+          resolve(canvas.toDataURL("image/jpeg", turboScan ? 0.88 : 0.82));
         } else {
           resolve(base64Str);
         }
@@ -2090,6 +2100,42 @@ export default function App() {
       setTimeout(() => resolve(window.Tesseract || null), 12000);
     });
     return window.__tcgTesseractPromise;
+  };
+
+  const getTesseractWorker = async (language: string): Promise<any | null> => {
+    if (typeof window === "undefined") return null;
+    const Tesseract = await loadTesseract();
+    if (!Tesseract?.createWorker) return null;
+    window.__tcgOcrWorkerPromises = window.__tcgOcrWorkerPromises || {};
+    if (!window.__tcgOcrWorkerPromises[language]) {
+      window.__tcgOcrWorkerPromises[language] = (async () => {
+        try {
+          return await Tesseract.createWorker(language);
+        } catch (err) {
+          console.warn(`Tesseract worker init failed for ${language}:`, err);
+          return null;
+        }
+      })();
+    }
+    return window.__tcgOcrWorkerPromises[language];
+  };
+
+  const recognizeOcrImage = async (
+    dataUrl: string,
+    language: string,
+    params?: Record<string, string>
+  ): Promise<any> => {
+    const worker = await getTesseractWorker(language);
+    if (worker?.recognize) {
+      if (worker.setParameters) {
+        await worker.setParameters(params || { tessedit_char_whitelist: "" });
+      }
+      return worker.recognize(dataUrl);
+    }
+
+    const Tesseract = await loadTesseract();
+    if (!Tesseract?.recognize) return null;
+    return Tesseract.recognize(dataUrl, language, params);
   };
 
   const detectYellowLabelFromImage = async (base64DataUrl: string): Promise<boolean> => {
@@ -2138,8 +2184,10 @@ export default function App() {
       "BASIC", "STAGE", "TRAINER", "ENERGY", "POKEMON", "POKÉMON", "HP", "WEAKNESS",
       "RESISTANCE", "RETREAT", "FLIP", "COINS", "DAMAGE", "HEADS", "EACH", "ATTACK",
       "FURY", "SWIPES", "ILLUS", "ILLUSTRATOR", "NINTENDO", "CREATURES", "GAME",
-      "FREAK", "CARD", "CARDS", "THIS", "FOR", "WHEN", "OBJECT"
+      "FREAK", "CARD", "CARDS", "THIS", "FOR", "WHEN", "OBJECT",
+      "EN", "DE", "FR", "IT", "ES", "PT"
     ]);
+    Object.keys(printedPokemonSetCodeAliases).forEach(alias => stopWords.add(alias));
     const lines = String(text || "")
       .split(/\n+/)
       .map(line => line.replace(/[^\p{L}\p{N}.'’ -]/gu, " ").replace(/\s+/g, " ").trim())
@@ -2148,10 +2196,15 @@ export default function App() {
     for (const line of lines) {
       const compact = line.trim();
       if (/\.(jpe?g|png|webp|gif)\b/i.test(compact) || /^[{\[]/.test(compact)) continue;
-      if (!/[A-Za-z]/.test(compact) || /\d{2,}/.test(compact)) continue;
-      const upper = compact.toUpperCase();
+      const nameLine = compact
+        .replace(/\b\d{1,3}\s*\/\s*\d{1,3}\b/g, " ")
+        .replace(/\b\d{1,4}\b/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!/[A-Za-z\u3040-\u30ff\u3400-\u9faf]/.test(nameLine)) continue;
+      const upper = nameLine.toUpperCase();
       if ([...stopWords].some(word => upper === word || upper.startsWith(`${word} `))) continue;
-      const words = compact.split(/\s+/).filter(w => w.length > 1);
+      const words = nameLine.split(/\s+/).filter(w => w.length > 1);
       if (words.length > 4) continue;
       const meaningful = words.filter(w => !stopWords.has(w.toUpperCase()));
       const name = meaningful.join(" ").trim();
@@ -2165,6 +2218,7 @@ export default function App() {
     const cardNumbers: string[] = [];
     const setCodes: string[] = [];
     const prices: number[] = [];
+    const names = guessCardNamesFromOcr(`${manualScanHint || ""}\n${text || ""}`);
     const digitSafe = joined.replace(/[OoQ]/g, "0");
     const fractional = digitSafe.match(/\b\d{1,3}\s*\/\s*\d{1,3}\b/g) || [];
     fractional.forEach(n => {
@@ -2185,7 +2239,7 @@ export default function App() {
     while ((printedSetMatch = printedSetRx.exec(joined)) !== null) {
       setCodes.push(printedPokemonSetCodeAliases[String(printedSetMatch[1]).toUpperCase()]);
     }
-    if (setCodes.length > 0) {
+    if (setCodes.length > 0 || names.length > 0) {
       cardNumbers.push(...extractStandaloneCardNumbers(joined));
     }
     const priceRegexes = [/(?:¥|￥|JPY)\s*([0-9][0-9,. ]{1,8})/g, /([0-9][0-9,. ]{1,8})\s*(?:円|yen|YEN)/g];
@@ -2204,12 +2258,15 @@ export default function App() {
       });
     }
     const uniq = (arr: string[]) => Array.from(new Set(arr.filter(Boolean).map(v => v.toUpperCase())));
-    const names = guessCardNamesFromOcr(`${manualScanHint || ""}\n${text || ""}`);
     const hasJapanese = /[ぁ-んァ-ン一-龯]/.test(joined);
     const hasLatinCardText = /[A-Za-z]{3,}/.test(joined);
     return {
       text: joined,
       card_numbers: uniq(cardNumbers),
+      primary_card_numbers: uniq(fractional.length > 0 ? fractional.flatMap(n => {
+        const clean = n.replace(/\s+/g, "");
+        return [clean, clean.split("/")[0]];
+      }) : cardNumbers),
       set_codes: uniq(setCodes.map(normalizePrintedSetCode)).filter(code => {
         const clean = code.replace(/\s+/g, "").toUpperCase();
         if (/^(SV|SM|S|XY|BW|DP|ADV|PCG|OP|ST|EB|PR)$/.test(clean)) return false;
@@ -2277,19 +2334,25 @@ export default function App() {
     });
   };
 
-  const buildOcrCrops = async (base64DataUrl: string, mode: "fast" | "fallback" = "fast") => {
+  const buildOcrCrops = async (base64DataUrl: string, mode: "fast" | "name" | "fallback" = "fast") => {
     const fastCrops = [
-      { name: "name-top", x: 0.10, y: 0.05, w: 0.76, h: 0.18, scale: 2.8, contrast: 1.55 },
-      { name: "bottom-number", x: 0.04, y: 0.80, w: 0.70, h: 0.17, scale: 3.8, contrast: 2.05 },
-      { name: "bottom-right-price", x: 0.55, y: 0.70, w: 0.40, h: 0.22, scale: 3.2, contrast: 1.8 }
+      { name: "bottom-id-wide", x: 0.02, y: 0.78, w: 0.78, h: 0.20, scale: 4.2, contrast: 2.2 },
+      { name: "bottom-left-id-tight", x: 0.03, y: 0.84, w: 0.52, h: 0.13, scale: 5.0, contrast: 2.35 },
+      { name: "bottom-footer-id", x: 0.03, y: 0.89, w: 0.58, h: 0.09, scale: 5.2, contrast: 2.45 },
+      { name: "bottom-right-price", x: 0.55, y: 0.68, w: 0.42, h: 0.24, scale: 3.4, contrast: 1.9 }
+    ];
+    const nameCrops = [
+      { name: "name-top", x: 0.08, y: 0.04, w: 0.82, h: 0.18, scale: 3.0, contrast: 1.65 },
+      { name: "name-upper-wide", x: 0.04, y: 0.06, w: 0.92, h: 0.24, scale: 2.6, contrast: 1.55 }
     ];
     const fallbackCrops = [
       { name: "bottom-left-number-tight", x: 0.08, y: 0.84, w: 0.42, h: 0.12, scale: 4.2, contrast: 2.15 },
       { name: "bottom-footer-number", x: 0.10, y: 0.88, w: 0.48, h: 0.08, scale: 4.6, contrast: 2.25 },
+      { name: "middle-set-number-safety", x: 0.00, y: 0.72, w: 0.82, h: 0.26, scale: 3.0, contrast: 2.0 },
       { name: "lower-third", x: 0.05, y: 0.62, w: 0.90, h: 0.30, scale: 2.3, contrast: 1.65 },
       { name: "full-card", x: 0.04, y: 0.04, w: 0.92, h: 0.92, scale: 1.25, contrast: 1.35 }
     ];
-    const crops = mode === "fast" ? fastCrops : fallbackCrops;
+    const crops = mode === "fast" ? fastCrops : mode === "name" ? nameCrops : fallbackCrops;
     const rendered = await Promise.all(crops.map(crop => cropImageForOcr(base64DataUrl, crop)));
     return rendered.filter(Boolean) as { name: string; dataUrl: string; bounding_box: { ymin: number; xmin: number; ymax: number; xmax: number } }[];
   };
@@ -2441,17 +2504,18 @@ export default function App() {
     try {
       setScanProgress("Lokale OCR-Engine laden...");
       const Tesseract = await loadTesseract();
-      if (Tesseract?.recognize) {
+      if (Tesseract?.recognize || Tesseract?.createWorker) {
         const texts: string[] = [];
         const runOcrTargets = async (
           targets: { name: string; dataUrl: string; bounding_box: { ymin: number; xmin: number; ymax: number; xmax: number } }[],
-          label: string
+          label: string,
+          stopOnHardId = false
         ) => {
           for (let i = 0; i < targets.length; i++) {
             const target = targets[i];
             setScanProgress(`${label}: ${target.name} (${i + 1}/${targets.length})...`);
-            const numberZone = /number|price|footer/i.test(target.name);
-            const result = await Tesseract.recognize(
+            const numberZone = /number|price|footer|id|set/i.test(target.name);
+            const result = await recognizeOcrImage(
               target.dataUrl,
               numberZone ? "eng" : "eng+jpn",
               numberZone
@@ -2467,14 +2531,35 @@ export default function App() {
               ...zoneHints,
               bounding_box: target.bounding_box
             });
+            if (stopOnHardId) {
+              const currentHints = parseClientScanHints(texts.join("\n"), filename, yellowLabel, "id-pass");
+              if (currentHints.card_numbers.length > 0 && currentHints.set_codes.length > 0) {
+                break;
+              }
+            }
           }
         };
 
-        setScanProgress("Schneller OCR-Scan...");
-        await runOcrTargets(await buildOcrCrops(base64DataUrl, "fast"), "Schneller OCR-Scan");
+        setScanProgress("Schneller ID-Scan...");
+        const fastTargets = await buildOcrCrops(base64DataUrl, "fast");
+        await runOcrTargets(fastTargets, "Schneller ID-Scan", true);
 
         const fastHints = parseClientScanHints(texts.join("\n"), filename, yellowLabel, "fast-pass");
-        const needsFallback = fastHints.card_numbers.length === 0 && fastHints.set_codes.length === 0 && fastHints.names.length === 0;
+        const hasHardId = fastHints.card_numbers.length > 0 && fastHints.set_codes.length > 0;
+        const hasPrice = Number(fastHints.yen_price || 0) > 0;
+        if (hasHardId && !hasPrice) {
+          const priceTarget = fastTargets.find(target => /price/i.test(target.name));
+          if (priceTarget && !localDetections.some(det => det.zone === priceTarget.name)) {
+            await runOcrTargets([priceTarget], "Preis-OCR");
+          }
+        }
+        if (!hasHardId) {
+          setScanProgress("Name-OCR als Fallback...");
+          await runOcrTargets(await buildOcrCrops(base64DataUrl, "name"), "Name-OCR");
+        }
+
+        const fallbackHints = parseClientScanHints(texts.join("\n"), filename, yellowLabel, "fallback-check");
+        const needsFallback = fallbackHints.card_numbers.length === 0 && fallbackHints.set_codes.length === 0 && fallbackHints.names.length === 0;
         if (needsFallback) {
           setScanProgress("OCR-Fallback fuer schwieriges Foto...");
           await runOcrTargets(await buildOcrCrops(base64DataUrl, "fallback"), "OCR-Fallback");
@@ -2507,8 +2592,8 @@ export default function App() {
   const getCachedScanResult = async (filename: string, base64Data: string): Promise<any | null> => {
     try {
       if (typeof window !== "undefined" && "caches" in window) {
-        const cache = await caches.open("pokemon-local-scan-results-v9-fast-ocr");
-        const cacheKey = `/api/cards/scan-cache-v9-fast-ocr?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
+        const cache = await caches.open("pokemon-local-scan-results-v10-id-first");
+        const cacheKey = `/api/cards/scan-cache-v10-id-first?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
         const cachedResponse = await cache.match(cacheKey);
         if (cachedResponse) {
           console.log(`Scan-Cache-Treffer für "${filename}" (${base64Data.length} Bytes). Lade sofort lokal!`);
@@ -2524,8 +2609,8 @@ export default function App() {
   const setCachedScanResult = async (filename: string, base64Data: string, data: any): Promise<void> => {
     try {
       if (typeof window !== "undefined" && "caches" in window && data && data.success) {
-        const cache = await caches.open("pokemon-local-scan-results-v9-fast-ocr");
-        const cacheKey = `/api/cards/scan-cache-v9-fast-ocr?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
+        const cache = await caches.open("pokemon-local-scan-results-v10-id-first");
+        const cacheKey = `/api/cards/scan-cache-v10-id-first?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
         await cache.put(cacheKey, new Response(JSON.stringify(data), {
           headers: { "Content-Type": "application/json" }
         }));
