@@ -310,7 +310,7 @@ function translateCardNameUsingCache(name: string): { english: string; german: s
   const suffixMatch = baseName.match(/^(.*?)\s*\b(ex|vmax|vstar|v|gx|star)\b\s*$/i);
   if (suffixMatch) {
     baseName = suffixMatch[1].trim();
-    suffix = " " + suffixMatch[2].toLowerCase();
+    suffix = formatCardSuffix(suffixMatch[2]);
   }
   
   const baseMatch = speciesTranslationCache[baseName] || ja_to_bilingual_static[baseName];
@@ -326,8 +326,8 @@ function translateCardNameUsingCache(name: string): { english: string; german: s
     const isJapaneseKey = /[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uff9f\u4e00-\u9faf\u3400-\u4dbf]/.test(jaKey);
     if (isJapaneseKey && cleanName.includes(jaKey)) {
       return {
-        english: cleanName.replace(jaKey, val.en),
-        german: cleanName.replace(jaKey, val.de || val.en)
+        english: replaceJapaneseNameWithSuffix(cleanName, jaKey, val.en),
+        german: replaceJapaneseNameWithSuffix(cleanName, jaKey, val.de || val.en)
       };
     }
   }
@@ -335,13 +335,36 @@ function translateCardNameUsingCache(name: string): { english: string; german: s
   for (const [jaKey, val] of Object.entries(ja_to_bilingual_static)) {
     if (cleanName.includes(jaKey)) {
       return {
-        english: cleanName.replace(jaKey, val.en),
-        german: cleanName.replace(jaKey, val.de || val.en)
+        english: replaceJapaneseNameWithSuffix(cleanName, jaKey, val.en),
+        german: replaceJapaneseNameWithSuffix(cleanName, jaKey, val.de || val.en)
       };
     }
   }
 
   return translateJapaneseBilingualStatic(name);
+}
+
+function formatCardSuffix(rawSuffix: string): string {
+  const lower = String(rawSuffix || "").toLowerCase();
+  if (lower === "ex") return " ex";
+  if (lower === "v") return " V";
+  if (lower === "vmax") return " VMAX";
+  if (lower === "vstar") return " VSTAR";
+  if (lower === "gx") return " GX";
+  if (lower === "star") return " Star";
+  return rawSuffix ? ` ${rawSuffix}` : "";
+}
+
+function replaceJapaneseNameWithSuffix(fullName: string, jaKey: string, translated: string): string {
+  const idx = fullName.indexOf(jaKey);
+  if (idx === -1) return fullName;
+  const before = fullName.slice(0, idx);
+  const after = fullName.slice(idx + jaKey.length);
+  const suffixMatch = after.match(/^\s*(ex|vmax|vstar|gx|star|v)(.*)$/i);
+  if (suffixMatch) {
+    return `${before}${translated}${formatCardSuffix(suffixMatch[1])}${suffixMatch[2] || ""}`.trim();
+  }
+  return `${before}${translated}${after}`.trim();
 }
 
 const ja_to_bilingual_static: Record<string, { en: string; de: string }> = {
@@ -442,15 +465,15 @@ function translateJapaneseBilingualStatic(jaName: string): { english: string; ge
   const match = ja_to_bilingual_static[cleaned];
   if (match) {
     return {
-      english: jaName.replace(cleaned, match.en),
-      german: jaName.replace(cleaned, match.de)
+      english: replaceJapaneseNameWithSuffix(jaName, cleaned, match.en),
+      german: replaceJapaneseNameWithSuffix(jaName, cleaned, match.de)
     };
   }
   for (const [jaKey, val] of Object.entries(ja_to_bilingual_static)) {
     if (jaName.includes(jaKey)) {
       return {
-        english: jaName.replace(jaKey, val.en),
-        german: jaName.replace(jaKey, val.de)
+        english: replaceJapaneseNameWithSuffix(jaName, jaKey, val.en),
+        german: replaceJapaneseNameWithSuffix(jaName, jaKey, val.de)
       };
     }
   }
@@ -462,7 +485,7 @@ function translateJapaneseBilingualStatic(jaName: string): { english: string; ge
 
 async function healJapaneseCardNames() {
   try {
-    const cards = await dbAll("SELECT id, api_card_id, local_name, english_name, pokemon_name, set_code FROM cards WHERE language = 'JA'", []) as any[];
+    const cards = await dbAll("SELECT id, api_card_id, local_name, english_name, pokemon_name, set_code FROM cards WHERE language = 'JA' AND game = 'pokemon'", []) as any[];
     if (cards.length === 0) return;
     
     console.log(`Checking ${cards.length} Japanese cards for name translation healing...`);
@@ -631,6 +654,7 @@ async function healExistingCardsRaritiesAndEnglishNames() {
       SELECT id, api_card_id, local_name, english_name, rarity 
       FROM cards 
       WHERE language = 'JA' 
+        AND game = 'pokemon'
         AND (
           rarity IS NULL 
           OR LOWER(rarity) IN ('none', 'null', '')
@@ -706,7 +730,7 @@ async function healExistingCardsRaritiesAndEnglishNames() {
 
 async function healJapaneseSetNames() {
   try {
-    const sets = await dbAll("SELECT id, set_code, set_name, language, english_set_name, german_set_name FROM sets", []) as any[];
+    const sets = await dbAll("SELECT id, set_code, set_name, language, english_set_name, german_set_name FROM sets WHERE game = 'pokemon'", []) as any[];
     if (sets.length === 0) return;
     
     console.log(`Checking ${sets.length} sets for name translation healing...`);
@@ -1374,13 +1398,19 @@ async function bootstrapDatabase(skipOnePieceSeed = false) {
 // Seeder for One Piece TCG sets and cards
 async function seedOnePieceData(force = false) {
   try {
+    const existingOpCards = await dbGet("SELECT COUNT(*) as count FROM cards WHERE game = 'onepiece'", []);
     if (!force) {
       const existingOpSets = await dbAll("SELECT id FROM sets WHERE game = 'onepiece'", []);
-      const countPR = await dbGet("SELECT COUNT(*) as count FROM cards WHERE set_code = 'PR' AND game = 'onepiece'", []);
-      if (existingOpSets && existingOpSets.length > 0 && countPR && countPR.count > 0) {
-        console.log("[OnePieceSeed] One Piece TCG sets and cards already present in database.");
+      if (existingOpCards && existingOpCards.count > 0 && existingOpSets && existingOpSets.length > 0) {
+        console.log("[OnePieceSeed] One Piece TCG official catalog rows already present in database.");
         return;
       }
+    }
+
+    const allowLegacyOnePieceSeed = false;
+    if (!allowLegacyOnePieceSeed) {
+      console.warn("[OnePieceSeed] Legacy hardcoded One Piece card seed is disabled. Use the official onepiece_importer.py sync to avoid name/artwork mismatches.");
+      return;
     }
 
     console.log("[OnePieceSeed] Bootstrapping dynamic One Piece TCG sets and premium cards...");
@@ -2472,6 +2502,27 @@ async function seedOnePieceData(force = false) {
   }
 }
 
+function runOnePieceOfficialImport(limit = "0") {
+  return new Promise<void>((resolve, reject) => {
+    const args = ["onepiece_importer.py", "import", "--sets-count", limit];
+    console.log(`[OnePieceSync] Running python3 ${args.join(" ")}`);
+    const importer = spawn("python3", args, {
+      env: { ...process.env, PYTHONUNBUFFERED: "1" }
+    });
+
+    importer.stdout.on("data", (data) => console.log(`[OnePieceSync] ${data.toString().trim()}`));
+    importer.stderr.on("data", (data) => console.warn(`[OnePieceSync WARN] ${data.toString().trim()}`));
+    importer.on("error", reject);
+    importer.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`One Piece importer exited with code ${code}`));
+      }
+    });
+  });
+}
+
 // ----------------------------------------
 
 // ----------------------------------------
@@ -2940,10 +2991,9 @@ app.get("/api/sets", async (req, res) => {
     
     // Auto-seed/Self-heal One Piece sets/cards if database was reset or cleared
     if (game === "onepiece") {
-      const checkSets = await dbAll("SELECT id FROM sets WHERE game = 'onepiece'", []);
-      const countPR = await dbGet("SELECT COUNT(*) as count FROM cards WHERE set_code = 'PR' AND game = 'onepiece'", []);
-      if (!checkSets || checkSets.length === 0 || !countPR || countPR.count === 0) {
-        console.log("[Auto-Seed] No One Piece sets or PR promos found, triggering seedOnePieceData...");
+      const checkCards = await dbAll("SELECT id FROM cards WHERE game = 'onepiece' LIMIT 1", []);
+      if (!checkCards || checkCards.length === 0) {
+        console.log("[Auto-Seed] No One Piece cards found. Legacy fallback seed is disabled; run the official One Piece importer.");
         await seedOnePieceData(true);
       }
     }
@@ -3085,9 +3135,8 @@ app.get("/api/cards", async (req, res) => {
     // Auto-seed/Self-heal One Piece sets/cards if database was reset or cleared
     if (game === "onepiece") {
       const checkCards = await dbAll("SELECT id FROM cards WHERE game = 'onepiece' LIMIT 1", []);
-      const countPR = await dbGet("SELECT COUNT(*) as count FROM cards WHERE set_code = 'PR' AND game = 'onepiece'", []);
-      if (!checkCards || checkCards.length === 0 || !countPR || countPR.count === 0) {
-        console.log("[Auto-Seed] No One Piece cards or PR promos found in get-cards, triggering seedOnePieceData...");
+      if (!checkCards || checkCards.length === 0) {
+        console.log("[Auto-Seed] No One Piece cards found in get-cards. Legacy fallback seed is disabled; run the official One Piece importer.");
         await seedOnePieceData(true);
       }
     }
@@ -3211,14 +3260,20 @@ app.get("/api/cards", async (req, res) => {
     // Deduplicate One Piece cards in list view if no explicit language filter is requested
     if (game === "onepiece" && !language) {
       const uniqueCards: any[] = [];
-      const seenCardNumbers = new Set<string>();
+      const seenVariantKeys = new Set<string>();
       for (const card of rows) {
-        if (!seenCardNumbers.has(card.card_number)) {
-          seenCardNumbers.add(card.card_number);
+        const apiVariantId = String(card.api_card_id || "").replace(/-(en|ja)$/i, "");
+        const variantKey = `${String(card.set_code || "").toUpperCase()}|${apiVariantId || String(card.card_number || "").toUpperCase()}`;
+        if (!seenVariantKeys.has(variantKey)) {
+          seenVariantKeys.add(variantKey);
           uniqueCards.push(card);
         } else {
-          // If already seen, but the seen one is JA and this one is EN, we prefer EN entries
-          const idx = uniqueCards.findIndex(c => c.card_number === card.card_number);
+          // If already seen, but the seen one is JA and this one is EN, we prefer EN entries.
+          const idx = uniqueCards.findIndex(c => {
+            const existingVariantId = String(c.api_card_id || "").replace(/-(en|ja)$/i, "");
+            const existingKey = `${String(c.set_code || "").toUpperCase()}|${existingVariantId || String(c.card_number || "").toUpperCase()}`;
+            return existingKey === variantKey;
+          });
           if (idx !== -1 && uniqueCards[idx].language === "JA" && card.language === "EN") {
             uniqueCards[idx] = card;
           }
@@ -3435,8 +3490,8 @@ app.post("/api/reset-db", async (req, res) => {
     await forceRecreateDatabase(true);
 
     if (game === "onepiece") {
-      console.log("DB reset complete. Seeding One Piece TCG sets & cards...");
-      await seedOnePieceData(true);
+      console.log("DB reset complete. Importing official One Piece TCG catalog...");
+      await runOnePieceOfficialImport("0");
     } else {
       // Spawn automatic background seed for pokemon so they are back immediately after a DB reset
       console.log("DB reset complete. Launching background Python seed for Pokemon...");
@@ -3688,7 +3743,7 @@ async function tryOfflineMatch(filename: string): Promise<any | null> {
 // Local OCR/data helpers for the local scanner
 function normalizeScanText(value: any): string {
   return String(value || "")
-    .replace(/[＿－ー–—]/g, "-")
+    .replace(/[＿－–—]/g, "-")
     .replace(/[￥]/g, "¥")
     .replace(/([0-9OoQ])\s*\/\s*([0-9OoQ])/g, "$1/$2")
     .replace(/(?<=\d)[OoQ](?=\d|\/|\b)/g, "0")
@@ -3783,7 +3838,7 @@ function cardNumberSqlParams(num: string) {
 
 function extractStandaloneCardNumbers(value: string): string[] {
   const out: string[] = [];
-  const rx = /(^|[^0-9/])(\d{1,3})(?!\s*\/|[0-9])/g;
+  const rx = /(^|[^A-Za-z0-9/])(\d{1,3})(?!\s*\/|[A-Za-z0-9])/g;
   let m: RegExpExecArray | null;
   while ((m = rx.exec(value || "")) !== null) {
     out.push(m[2]);
@@ -3794,7 +3849,7 @@ function extractStandaloneCardNumbers(value: string): string[] {
 function normalizeSetCodeToken(value: any): string {
   return String(value || "")
     .replace(/\s+/g, "")
-    .replace(/[＿－ー–—]/g, "-")
+    .replace(/[＿－–—]/g, "-")
     .toUpperCase();
 }
 
@@ -4190,8 +4245,9 @@ app.get("/api/run-python", async (req, res) => {
   if (game === "onepiece") {
     res.write(`data: [SYSTEM] Starte One Piece TCG Live-Crawl & Synchronisations-Engine...\n\n`);
     
-    // Determine limit: "0" indicates ALL sets, otherwise we stream standard sets
-    const limit = count === "0" ? "0" : "10";
+    // Determine limit: "0" indicates ALL sets, otherwise a standard modern catalog slice.
+    const allCards = String(req.query.all_cards || "").toLowerCase() === "true";
+    const limit = allCards || count === "0" ? "0" : "10";
     const args = ["onepiece_importer.py", "import", "--sets-count", limit];
     
     res.write(`data: [SYSTEM] Führe aus: python3 ${args.join(" ")}\n\n`);

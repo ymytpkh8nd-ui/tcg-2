@@ -117,6 +117,8 @@ def parse_cards_from_html(html_content, set_code, set_name, language):
         # 2. Card Name
         name_match = re.search(r'<div class="cardName">(.*?)</div>', block_text, re.DOTALL)
         card_name = html.unescape(name_match.group(1).strip()) if name_match else ""
+        if language == "EN":
+            card_name = add_parallel_suffix(card_name, card_id)
         
         # 3. Image URL
         img_match = re.search(r'data-src="([^"]+)"', block_text)
@@ -166,6 +168,160 @@ def parse_cards_from_html(html_content, set_code, set_name, language):
         cards.append(card_obj)
         
     return cards
+
+def is_parallel_card_id(card_id):
+    return bool(re.search(r'_p\d+$', str(card_id or ""), re.IGNORECASE))
+
+def base_card_id(card_id):
+    return re.sub(r'_p\d+$', '', str(card_id or ""), flags=re.IGNORECASE)
+
+def add_parallel_suffix(name, card_id):
+    clean_name = (name or "").strip()
+    if not clean_name:
+        return clean_name
+    if is_parallel_card_id(card_id) and "parallel" not in clean_name.lower():
+        return f"{clean_name} (Parallel)"
+    return clean_name
+
+def build_name_indexes(cards, name_key):
+    by_id = {}
+    base_by_number = {}
+    first_by_number = {}
+
+    for card in cards:
+        card_id = str(card.get("card_id") or "")
+        card_number = card.get("card_number")
+        name = (card.get(name_key) or "").strip()
+        if not card_id or not name:
+            continue
+
+        by_id[card_id.lower()] = name
+        if card_number and card_number not in first_by_number:
+            first_by_number[card_number] = name
+        if card_number and not is_parallel_card_id(card_id):
+            base_by_number[card_number] = name
+
+    return by_id, base_by_number, first_by_number
+
+def paired_name(card, exact_by_id, base_by_number, first_by_number, fallback=""):
+    card_id = str(card.get("card_id") or "")
+    card_number = card.get("card_number")
+    exact = exact_by_id.get(card_id.lower())
+    if exact:
+        return add_parallel_suffix(exact, card_id)
+
+    base_id_name = exact_by_id.get(base_card_id(card_id).lower())
+    if base_id_name:
+        return add_parallel_suffix(base_id_name, card_id)
+
+    number_name = base_by_number.get(card_number) or first_by_number.get(card_number) or fallback
+    return add_parallel_suffix(number_name, card_id)
+
+def clear_one_piece_catalog(cursor):
+    log("Bereinige alte One-Piece-Katalogdaten vor dem offiziellen Neuimport...")
+    cursor.execute("DELETE FROM cards WHERE game = 'onepiece'")
+    cursor.execute("DELETE FROM sets WHERE game = 'onepiece'")
+
+def heal_saved_one_piece_rows(cursor):
+    # Inventory/favorites keep snapshots for export. Refresh those snapshots from
+    # the authoritative card catalog while preserving price, notes and dates.
+    log("Synchronisiere One-Piece Inventar/Favoriten mit dem offiziellen Katalog...")
+    def find_match(row):
+        cursor.execute("""
+            SELECT *
+            FROM cards
+            WHERE game = 'onepiece'
+              AND (
+                api_card_id = ?
+                OR (
+                  card_number = ?
+                  AND language = ?
+                  AND set_code = ?
+                  AND api_card_id NOT LIKE '%\\_p%' ESCAPE '\\'
+                )
+              )
+            ORDER BY
+              CASE WHEN api_card_id = ? THEN 0 ELSE 1 END,
+              CASE WHEN api_card_id LIKE '%\\_p%' ESCAPE '\\' THEN 1 ELSE 0 END,
+              api_card_id
+            LIMIT 1
+        """, (
+            row["api_card_id"],
+            row["card_number"],
+            row["language"],
+            row["set_code"],
+            row["api_card_id"]
+        ))
+        return cursor.fetchone()
+
+    cursor.execute("SELECT * FROM reseller_inventory WHERE game = 'onepiece'")
+    inventory_rows = cursor.fetchall()
+    healed_inventory = 0
+    for row in inventory_rows:
+        match = find_match(row)
+        if not match:
+            continue
+        cursor.execute("""
+            UPDATE reseller_inventory
+            SET api_card_id = ?,
+                pokemon_name = ?,
+                local_name = ?,
+                japanese_name = ?,
+                set_name = ?,
+                set_code = ?,
+                rarity = ?,
+                image_small = ?
+            WHERE id = ?
+        """, (
+            match["api_card_id"],
+            match["pokemon_name"],
+            match["local_name"],
+            match["japanese_name"],
+            match["set_name"],
+            match["set_code"],
+            match["rarity"],
+            match["image_small"],
+            row["id"]
+        ))
+        healed_inventory += 1
+
+    cursor.execute("SELECT * FROM reseller_favorites WHERE game = 'onepiece'")
+    favorite_rows = cursor.fetchall()
+    healed_favorites = 0
+    for row in favorite_rows:
+        match = find_match(row)
+        if not match:
+            continue
+        try:
+            cursor.execute("""
+                UPDATE reseller_favorites
+                SET api_card_id = ?,
+                    english_name = ?,
+                    local_name = ?,
+                    japanese_name = ?,
+                    set_name = ?,
+                    set_code = ?,
+                    rarity = ?,
+                    image_small = ?,
+                    image_large = ?
+                WHERE id = ?
+            """, (
+                match["api_card_id"],
+                match["english_name"],
+                match["local_name"],
+                match["japanese_name"],
+                match["set_name"],
+                match["set_code"],
+                match["rarity"],
+                match["image_small"],
+                match["image_large"],
+                row["id"]
+            ))
+            healed_favorites += 1
+        except sqlite3.IntegrityError:
+            log(f"Favorit {row['id']} übersprungen: Zielkarte {match['api_card_id']} existiert bereits in Favoriten.", "WARNING")
+
+    log(f"Inventar/Favoriten aktualisiert: {healed_inventory}/{len(inventory_rows)} Inventar, {healed_favorites}/{len(favorite_rows)} Favoriten.")
 
 def sync_one_piece(limit_sets=0):
     log("=== One Piece TCG Live Synchronisations-Engine ===")
@@ -256,6 +412,9 @@ def sync_one_piece(limit_sets=0):
     conn = get_connection(DATABASE_NAME)
     cursor = conn.cursor()
     
+    clear_one_piece_catalog(cursor)
+    conn.commit()
+    
     # Loop over sets and scrape
     for idx, code in enumerate(all_codes):
         en_meta = en_sets.get(code)
@@ -290,10 +449,11 @@ def sync_one_piece(limit_sets=0):
             log(f"     Keine Karten für Set [{code}] gefunden. Überspringe.", "WARNING")
             continue
             
-        # Reconcile local names and translations!
-        # Create mapping of card number -> English Name
-        en_names_map = {c["card_number"]: c["english_name"] for c in en_cards}
-        ja_names_map = {c["card_number"]: c["japanese_name"] for c in ja_cards}
+        # Reconcile local names and translations by official modal/card id.
+        # One Piece parallel artworks share printed card numbers, so card_number
+        # alone can pair a parallel name with the normal artwork.
+        en_names_by_id, en_base_by_number, en_first_by_number = build_name_indexes(en_cards, "english_name")
+        ja_names_by_id, ja_base_by_number, ja_first_by_number = build_name_indexes(ja_cards, "japanese_name")
         
         # 1. Write Sets to sqlite
         # For English
@@ -323,7 +483,7 @@ def sync_one_piece(limit_sets=0):
         # Write Cards to sqlite
         # EN cards
         for card in en_cards:
-            jp_name = ja_names_map.get(card["card_number"], "")
+            jp_name = paired_name(card, ja_names_by_id, ja_base_by_number, ja_first_by_number, "")
             uni_name = f"{card['english_name']} {card['card_number']}"
             api_id = f"{card['card_id'].lower()}-en"
             
@@ -354,7 +514,7 @@ def sync_one_piece(limit_sets=0):
             
         # JA cards
         for card in ja_cards:
-            en_name = en_names_map.get(card["card_number"], "") or card["card_id"]
+            en_name = paired_name(card, en_names_by_id, en_base_by_number, en_first_by_number, card["card_id"]) or card["card_id"]
             uni_name = f"{en_name} {card['card_number']}"
             api_id = f"{card['card_id'].lower()}-ja"
             
@@ -388,7 +548,9 @@ def sync_one_piece(limit_sets=0):
         
         # Respect spacing spacing delay
         time.sleep(0.3)
-        
+    
+    heal_saved_one_piece_rows(cursor)
+    conn.commit()
     conn.close()
     log("[SYSTEM] Synchronisation vollständig beendet und Commits verarbeitet!")
 
