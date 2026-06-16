@@ -2530,6 +2530,27 @@ function runOnePieceOfficialImport(limit = "0") {
 // ----------------------------------------
 
 // URL Link Generators mirroring python logic
+const stripJapaneseChars = (value: any) =>
+  String(value || "").replace(/[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uff9f\u4e00-\u9faf\u3400-\u4dbf]/g, "").trim().replace(/\s+/g, " ");
+
+const buildOnePieceSearchNumber = (setCode: any, cardNum: any, apiCardId: any = "") => {
+  const rawCardNum = stripJapaneseChars(cardNum).replace(/\s+/g, "").replace(/_p$/i, "");
+  const rawApiId = stripJapaneseChars(apiCardId).replace(/\s+/g, "").replace(/-(en|ja)$/i, "").replace(/_p$/i, "");
+  const code = stripJapaneseChars(setCode).toUpperCase().replace(/\s+/g, "");
+  const existingFull = rawCardNum || rawApiId;
+  if (/^(OP|ST|EB|PRB|P)-?\d+/i.test(existingFull)) return existingFull.toUpperCase();
+  if (code && /^\d{1,3}$/.test(existingFull)) return `${code}-${existingFull.padStart(3, "0")}`;
+  if (code && existingFull) return `${code}-${existingFull}`.toUpperCase();
+  return existingFull.toUpperCase();
+};
+
+const buildCardSearchNumber = (card: any, game = "pokemon") => {
+  if (game === "onepiece") {
+    return buildOnePieceSearchNumber(card?.set_code, card?.card_number, card?.api_card_id);
+  }
+  return stripJapaneseChars(card?.card_number || "");
+};
+
 const generateEbayLink = (engName: string, setName: string, cardNum: string, game = "pokemon") => {
   const query = game === "onepiece"
     ? `${engName} ${setName} ${cardNum} one piece tcg`
@@ -2537,14 +2558,62 @@ const generateEbayLink = (engName: string, setName: string, cardNum: string, gam
   return `https://www.ebay.de/sch/i.html?_nkw=${encodeURIComponent(query)}`;
 };
 
-const generateCardmarketLink = (engName: string, cardNum: string, game = "pokemon") => {
-  // strip out any Japanese characters from both english_name and card number
-  const cleanEngName = (engName || "").replace(/[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uff9f\u4e00-\u9faf\u3400-\u4dbf]/g, "").trim().replace(/\s+/g, " ");
-  const cleanCardNum = (cardNum || "").replace(/[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uff9f\u4e00-\u9faf\u3400-\u4dbf]/g, "").trim().replace(/\s+/g, " ");
-  
-  const query = `${cleanEngName} ${cleanCardNum}`.trim().replace(/\s+/g, " ");
+const cardmarketLanguageId = (language: any) => {
+  const lang = String(language || "").toUpperCase();
+  if (lang === "JA" || lang === "JP" || lang === "JPN") return "7";
+  if (lang === "DE" || lang === "GER" || lang === "GERMAN") return "3";
+  if (lang === "FR") return "2";
+  if (lang === "ES") return "4";
+  if (lang === "IT") return "5";
+  if (lang === "PT") return "8";
+  if (lang === "KO" || lang === "KR") return "10";
+  if (lang === "ZH" || lang === "CN" || lang === "CHT") return "11";
+  return "1";
+};
+
+const generateCardmarketLink = (engName: string, cardNum: string, game = "pokemon", language = "EN") => {
+  const cleanEngName = stripJapaneseChars(engName);
+  const cleanCardNum = stripJapaneseChars(cardNum);
+  const onePieceName = cleanEngName
+    .replace(/\b(?:OP|ST|EB|PRB|P)-?\d{1,3}\b/gi, "")
+    .replace(/\(parallel\)|parallel|alternate art|alt art/gi, "")
+    .replace(/\bone piece\b|\btcg\b/gi, "")
+    .trim()
+    .replace(/\s+/g, " ");
+  const query = game === "onepiece"
+    ? `${onePieceName} ${cleanCardNum}`.trim().replace(/\s+/g, " ")
+    : `${cleanEngName} ${cleanCardNum}`.trim().replace(/\s+/g, " ");
   const gameSubpath = game === "onepiece" ? "OnePiece" : "Pokemon";
-  return `https://www.cardmarket.com/de/${gameSubpath}/Products/Search?searchString=${encodeURIComponent(query)}`;
+  const url = new URL(`https://www.cardmarket.com/de/${gameSubpath}/Products/Search`);
+  url.searchParams.set("searchString", query);
+  url.searchParams.set("language", cardmarketLanguageId(language));
+  url.searchParams.set("minCondition", "2");
+  return url.toString();
+};
+
+const generateGoogleLink = (engName: string, setName: string, cardNum: string, game = "pokemon") => {
+  const query = game === "onepiece"
+    ? `${engName} ${setName} ${cardNum} One Piece TCG`
+    : `${engName} ${setName} ${cardNum} Pokemon TCG`;
+  return `https://www.google.com/search?q=${encodeURIComponent(query.trim().replace(/\s+/g, " "))}`;
+};
+
+const generateTcgplayerLink = (engName: string, setName: string, cardNum: string, game = "pokemon") => {
+  const query = game === "onepiece"
+    ? `${engName} ${setName} ${cardNum} One Piece`
+    : `${engName} ${setName} ${cardNum} Pokemon`;
+  return `https://www.tcgplayer.com/search/all/product?q=${encodeURIComponent(query.trim().replace(/\s+/g, " "))}&view=grid`;
+};
+
+const attachMarketPriceFields = (card: any, market: any) => {
+  if (!market) return card;
+  return {
+    ...card,
+    market_price_eur: positiveMoney(market.market_price_eur),
+    market_source: market.source || "",
+    market_observed_at: market.observed_at || "",
+    market_source_url: market.source_url || ""
+  };
 };
 
 const enrichCard = (card: any) => {
@@ -2597,8 +2666,8 @@ const enrichCard = (card: any) => {
     }
   }
 
-  // Compute Cardmarket link using English name and Card number (reverted from including Set Name)
-  const cardmarketLink = generateCardmarketLink(cleanCardmarketTerm, card.card_number || "", game);
+  const searchNumber = buildCardSearchNumber(card, game);
+  const cardmarketLink = generateCardmarketLink(cleanCardmarketTerm, searchNumber, game, card.language || "EN");
     
   let cleanEbayTerm = englishName || "";
   if (/[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uff9f\u4e00-\u9faf\u3400-\u4dbf]/.test(cleanEbayTerm)) {
@@ -2607,9 +2676,12 @@ const enrichCard = (card: any) => {
 
   const ebayLink = isJa
     ? (game === "onepiece"
-       ? `https://www.ebay.de/sch/i.html?_nkw=${encodeURIComponent(`${cleanEbayTerm} Japanese One Piece TCG ${card.set_code || ""} ${card.card_number || ""}`)}`
+       ? `https://www.ebay.de/sch/i.html?_nkw=${encodeURIComponent(`${cleanEbayTerm} Japanese One Piece TCG ${searchNumber}`)}`
        : `https://www.ebay.de/sch/i.html?_nkw=${encodeURIComponent(`${cleanEbayTerm} Japanese ${card.set_code || ""} ${card.card_number || ""}`)}`)
-    : generateEbayLink(cleanEbayTerm, card.set_name || "", card.card_number || "", game);
+    : generateEbayLink(cleanEbayTerm, card.set_name || "", searchNumber, game);
+
+  const googleLink = generateGoogleLink(cleanEbayTerm || cleanCardmarketTerm, englishSetName || card.set_name || "", searchNumber, game);
+  const tcgplayerLink = generateTcgplayerLink(cleanEbayTerm || cleanCardmarketTerm, englishSetName || card.set_name || "", searchNumber, game);
 
   return {
     ...card,
@@ -2617,6 +2689,8 @@ const enrichCard = (card: any) => {
     pokemon_name: pokemonName,
     cardmarket_link: cardmarketLink,
     ebay_link: ebayLink,
+    google_link: googleLink,
+    tcgplayer_link: tcgplayerLink,
     english_set_name: englishSetName || "",
     german_set_name: germanSetName || ""
   };
@@ -2842,7 +2916,7 @@ function buildManualMarketOverride(value: any) {
 function getBackendEstimatedPrices(card: any, game: string) {
   // Transparent local model used only when no manual/imported market price exists.
   // It is intentionally conservative and no longer pretends to be Cardmarket data.
-  if (!card) return { raw: 0, psa8: 0, psa9: 0, psa10: 0, source: "none", confidence: "none" };
+  if (!card) return { raw: 0, source: "none", confidence: "none" };
   const score = localDemandScoreForCard(card);
   const r = String(card.rarity || "").toLowerCase();
   let rawPrice = 0.35;
@@ -2857,9 +2931,6 @@ function getBackendEstimatedPrices(card: any, game: string) {
   rawPrice = Math.max(0.05, Math.round(rawPrice * 100) / 100);
   return {
     raw: rawPrice,
-    psa8: Math.round(rawPrice * 1.45 * 100) / 100,
-    psa9: Math.round(rawPrice * 2.25 * 100) / 100,
-    psa10: Math.round(rawPrice * (score >= 80 ? 7.5 : 4.5) * 100) / 100,
     source: "local_model_reference",
     confidence: "not_a_market_price",
     is_market_price: false
@@ -3049,9 +3120,6 @@ app.get("/api/sets", async (req, res) => {
         const prices = marketRaw > 0
           ? {
               raw: marketRaw,
-              psa8: 0,
-              psa9: 0,
-              psa10: 0,
               source: market.source,
               confidence: "trusted",
               observed_at: market.observed_at,
@@ -3059,9 +3127,6 @@ app.get("/api/sets", async (req, res) => {
             }
           : {
               raw: 0,
-              psa8: 0,
-              psa9: 0,
-              psa10: 0,
               source: "missing_market_price",
               confidence: "missing",
               is_market_price: false,
@@ -3097,10 +3162,6 @@ app.get("/api/sets", async (req, res) => {
       const avgPriceRaw = pricedCardPrices.length > 0 ? totalValueRaw / pricedCardPrices.length : 0;
       const highestPriceRaw = pricedCardPrices.length > 0 ? Math.max(...pricedCardPrices.map(cp => cp.prices.raw)) : 0;
 
-      const totalValuePsa10 = 0;
-      const avgPricePsa10 = 0;
-      const highestPricePsa10 = 0;
-
       enrichedRows.push({
         ...s,
         english_set_name: englishSetName || "",
@@ -3111,9 +3172,6 @@ app.get("/api/sets", async (req, res) => {
           total_value_raw: totalValueRaw,
           average_price_raw: avgPriceRaw,
           highest_price_raw: highestPriceRaw,
-          total_value_psa10: totalValuePsa10,
-          average_price_psa10: avgPricePsa10,
-          highest_price_psa10: highestPricePsa10,
           price_source: pricedCardPrices.length > 0 ? "market_prices" : "missing_market_prices",
           price_confidence: pricedCardPrices.length > 0 ? "trusted/imported_or_manual" : "missing"
         },
@@ -3282,7 +3340,24 @@ app.get("/api/cards", async (req, res) => {
       rows = uniqueCards;
     }
 
-    const enrichedRows = rows.map(enrichCard);
+    const marketRows = rows.length > 0
+      ? await dbAll(
+          `SELECT * FROM market_prices WHERE game = ? AND api_card_id IN (${rows.map(() => "?").join(",")})`,
+          [String(game).toLowerCase(), ...rows.map((c: any) => c.api_card_id)]
+        )
+      : [];
+    const marketByCardId = new Map<string, any[]>();
+    for (const row of marketRows) {
+      const key = String(row.api_card_id || "");
+      const list = marketByCardId.get(key) || [];
+      list.push(row);
+      marketByCardId.set(key, list);
+    }
+
+    const enrichedRows = rows.map((card: any) => {
+      const market = selectBestMarketPrice(marketByCardId.get(String(card.api_card_id || "")) || []);
+      return enrichCard(attachMarketPriceFields(card, market));
+    });
     res.json(enrichedRows);
   } catch (err: any) {
     res.status(550).json({ error: err.message });
@@ -4542,7 +4617,25 @@ app.get("/api/favorites", async (req, res) => {
     } else {
       list = await dbAll("SELECT * FROM reseller_favorites ORDER BY id DESC", []);
     }
-    res.json({ success: true, count: list.length, data: list });
+    const gameLower = game ? String(game).toLowerCase() : "";
+    const marketRows = list.length > 0
+      ? await dbAll(
+          `SELECT * FROM market_prices WHERE api_card_id IN (${list.map(() => "?").join(",")})${gameLower ? " AND game = ?" : ""}`,
+          gameLower ? [...list.map((c: any) => c.api_card_id), gameLower] : list.map((c: any) => c.api_card_id)
+        )
+      : [];
+    const marketByCardId = new Map<string, any[]>();
+    for (const row of marketRows) {
+      const key = String(row.api_card_id || "");
+      const rows = marketByCardId.get(key) || [];
+      rows.push(row);
+      marketByCardId.set(key, rows);
+    }
+    const enrichedList = list.map((card: any) => {
+      const market = selectBestMarketPrice(marketByCardId.get(String(card.api_card_id || "")) || []);
+      return enrichCard(attachMarketPriceFields(card, market));
+    });
+    res.json({ success: true, count: enrichedList.length, data: enrichedList });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

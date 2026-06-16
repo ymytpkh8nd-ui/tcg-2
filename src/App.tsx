@@ -37,11 +37,9 @@ import {
   MapPin,
   Calendar,
   ShieldCheck,
-  AlertTriangle,
   CreditCard,
   Tag,
   Edit,
-  Sliders,
   Menu,
   MoreVertical
 } from "lucide-react";
@@ -81,6 +79,13 @@ interface PokemonCard {
   cardmarket_id: string | null;
   cardmarket_link: string;
   ebay_link: string;
+  google_link?: string;
+  tcgplayer_link?: string;
+  market_price_eur?: number;
+  manual_market_price_eur?: number;
+  market_source?: string;
+  market_observed_at?: string;
+  market_source_url?: string;
   english_set_name?: string;
   german_set_name?: string;
 }
@@ -174,7 +179,7 @@ export function formatCardName(card: any): string {
 export function getEstimatedCardmarketPrices(card: any) {
   // Honest price state: only user/imported market prices are treated as prices.
   // The local model is kept as reference metadata and must not drive BUY decisions.
-  if (!card) return { raw: 0, psa8: 0, psa9: 0, psa10: 0, source: "none", confidence: "none", isMarketPrice: false };
+  if (!card) return { raw: 0, source: "none", confidence: "none", isMarketPrice: false };
   const text = `${card.english_name || ""} ${card.pokemon_name || ""} ${card.local_name || ""} ${card.rarity || ""} ${card.set_name || ""}`.toLowerCase();
   let score = 28;
   const premiumNames = ["pikachu", "charizard", "glurak", "mew", "mewtwo", "eevee", "umbreon", "nachtara", "rayquaza", "gengar", "lugia", "latias", "latios", "iono", "lillie", "nami", "luffy", "zoro", "shanks", "ace", "law", "yamato"];
@@ -199,9 +204,6 @@ export function getEstimatedCardmarketPrices(card: any) {
   if (Number.isFinite(manualPrice) && manualPrice > 0) {
     return {
       raw: Math.round(manualPrice * 100) / 100,
-      psa8: 0,
-      psa9: 0,
-      psa10: 0,
       source: card?.market_source || "manual",
       confidence: "trusted",
       isMarketPrice: true,
@@ -212,9 +214,6 @@ export function getEstimatedCardmarketPrices(card: any) {
 
   return {
     raw: 0,
-    psa8: 0,
-    psa9: 0,
-    psa10: 0,
     source: "missing_market_price",
     confidence: "missing",
     isMarketPrice: false,
@@ -253,6 +252,18 @@ const extractStandaloneCardNumbers = (value: string) => {
   let m: RegExpExecArray | null;
   while ((m = rx.exec(value || "")) !== null) out.push(m[2]);
   return out;
+};
+
+const buildGoogleSearchLink = (card: any, game = "pokemon") => {
+  const name = formatCardName(card);
+  const query = `${name} ${card?.set_name || ""} ${card?.card_number || ""} ${game === "onepiece" ? "One Piece TCG" : "Pokemon TCG"}`;
+  return `https://www.google.com/search?q=${encodeURIComponent(query.trim().replace(/\s+/g, " "))}`;
+};
+
+const buildTcgplayerSearchLink = (card: any, game = "pokemon") => {
+  const name = formatCardName(card);
+  const query = `${name} ${card?.set_name || ""} ${card?.card_number || ""} ${game === "onepiece" ? "One Piece" : "Pokemon"}`;
+  return `https://www.tcgplayer.com/search/all/product?q=${encodeURIComponent(query.trim().replace(/\s+/g, " "))}&view=grid`;
 };
 
 export function getLocalDealAnalysis(card: any, exchangeRate = 165, importVat = 19, customsFee = 0.35, platformFee = 12, targetMargin = 30) {
@@ -808,6 +819,9 @@ export default function App() {
 
   // Results & Layout Preferences
   const [cards, setCards] = useState<PokemonCard[]>([]);
+  const [manualPriceDrafts, setManualPriceDrafts] = useState<Record<string, string>>({});
+  const [manualPriceSaving, setManualPriceSaving] = useState<Record<string, boolean>>({});
+  const [manualPriceErrors, setManualPriceErrors] = useState<Record<string, string>>({});
   const [sortBy, setSortBy] = useState<"set_name" | "card_number" | "rarity" | "">("");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
 
@@ -851,7 +865,6 @@ export default function App() {
   }, [cards, sortBy, sortOrder]);
   const [sets, setSets] = useState<PokemonSet[]>([]);
   const [selectedCard, setSelectedCard] = useState<PokemonCard | null>(null);
-  const [selectedGrade, setSelectedGrade] = useState<10 | 9 | 8>(10);
   const [inventoryAddTargetCard, setInventoryAddTargetCard] = useState<any | null>(null);
   const [addFavPurchasePrice, setAddFavPurchasePrice] = useState<number>(0);
   const [addFavPurchasePriceYen, setAddFavPurchasePriceYen] = useState<number>(0);
@@ -863,12 +876,6 @@ export default function App() {
   const [viewMode, setViewMode] = useState<"grid" | "table">("grid");
   const [searchLimit, setSearchLimit] = useState(100);
   const [allCardsImport, setAllCardsImport] = useState(true);
-
-  // States for Reseller Evaluation
-  const [evaluationLoading, setEvaluationLoading] = useState(false);
-  const [evaluationDetails, setEvaluationDetails] = useState<any | null>(null);
-  const [evaluationError, setEvaluationError] = useState<string | null>(null);
-  const [modalCustomSellPrice, setModalCustomSellPrice] = useState<number>(0);
 
   // States for Japan Arbitrage & Social Trends
   const [arbitrageExchangeRate, setArbitrageExchangeRate] = useState<number>(165.0);
@@ -1273,6 +1280,208 @@ export default function App() {
     return favorites.some(fav => String(fav.api_card_id) === idStr);
   };
 
+  const getCardPriceKey = (card: any) => `${String(card?.game || activeGame).toLowerCase()}:${card?.api_card_id || card?.id}`;
+
+  const formatYenFromEur = (eur: number) => {
+    if (!Number.isFinite(eur) || eur <= 0) return "¥0";
+    return `¥${Math.round(eur * arbitrageExchangeRate).toLocaleString("de-DE")}`;
+  };
+
+  const applyManualMarketPriceToCard = (card: any, priceRow: any) => ({
+    ...card,
+    market_price_eur: Number(priceRow?.market_price_eur || 0),
+    manual_market_price_eur: Number(priceRow?.market_price_eur || 0),
+    market_source: priceRow?.source || "manual",
+    market_observed_at: priceRow?.observed_at || new Date().toISOString(),
+    market_source_url: priceRow?.source_url || ""
+  });
+
+  const handleSaveManualMarketPrice = async (card: any) => {
+    const key = getCardPriceKey(card);
+    const rawDraft = manualPriceDrafts[key] ?? String(card.market_price_eur || card.manual_market_price_eur || "");
+    const marketPrice = Number(String(rawDraft).replace(",", "."));
+
+    if (!Number.isFinite(marketPrice) || marketPrice <= 0) {
+      setManualPriceErrors(prev => ({ ...prev, [key]: "Bitte positiven Euro-Preis eingeben." }));
+      return;
+    }
+
+    setManualPriceSaving(prev => ({ ...prev, [key]: true }));
+    setManualPriceErrors(prev => ({ ...prev, [key]: "" }));
+
+    try {
+      const response = await fetch("/api/prices/upsert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          api_card_id: card.api_card_id,
+          game: String(card.game || activeGame).toLowerCase(),
+          market_price_eur: marketPrice,
+          source: "manual",
+          notes: "Manueller Raw-Marktpreis aus der Kartenliste."
+        })
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || "Preis konnte nicht gespeichert werden.");
+      }
+
+      const updatedCard = applyManualMarketPriceToCard(card, data.price);
+      setCards(prev => prev.map(item => String(item.api_card_id) === String(card.api_card_id) ? applyManualMarketPriceToCard(item, data.price) : item));
+      setInventory(prev => prev.map(item => String(item.api_card_id) === String(card.api_card_id) ? applyManualMarketPriceToCard(item, data.price) : item));
+      setFavorites(prev => prev.map(item => String(item.api_card_id) === String(card.api_card_id) ? applyManualMarketPriceToCard(item, data.price) : item));
+      setSelectedCard(prev => prev && String(prev.api_card_id) === String(card.api_card_id) ? applyManualMarketPriceToCard(prev, data.price) : prev);
+      setManualPriceDrafts(prev => ({ ...prev, [key]: Number(data.price.market_price_eur || marketPrice).toFixed(2) }));
+      fetchSets();
+    } catch (err: any) {
+      setManualPriceErrors(prev => ({ ...prev, [key]: err.message || "Speichern fehlgeschlagen." }));
+    } finally {
+      setManualPriceSaving(prev => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const renderManualPriceEditor = (card: any, mode: "mobile" | "grid" | "table" = "grid") => {
+    const key = getCardPriceKey(card);
+    const prices = getEstimatedCardmarketPrices(card);
+    const currentEur = prices.isMarketPrice ? Number(prices.raw || 0) : 0;
+    const draft = manualPriceDrafts[key] ?? (currentEur > 0 ? currentEur.toFixed(2) : "");
+    const draftEur = Number(String(draft).replace(",", "."));
+    const previewEur = Number.isFinite(draftEur) && draftEur > 0 ? draftEur : currentEur;
+    const saving = Boolean(manualPriceSaving[key]);
+    const errorMsg = manualPriceErrors[key];
+    const compact = mode === "table" || mode === "mobile";
+
+    return (
+      <div onClick={(e) => e.stopPropagation()} className={`space-y-1 ${mode === "table" ? "min-w-[150px]" : ""}`}>
+        <div className={`font-mono ${compact ? "text-[9px]" : "text-[10px]"} ${currentEur > 0 ? "text-emerald-400" : "text-amber-400"} font-bold`}>
+          {currentEur > 0 ? `Raw: €${currentEur.toFixed(2)} (${formatYenFromEur(currentEur)})` : "Raw: CHECK"}
+        </div>
+        <div className="flex items-center gap-1">
+          <input
+            type="number"
+            inputMode="decimal"
+            step="0.01"
+            min="0"
+            placeholder="€"
+            value={draft}
+            onChange={(e) => setManualPriceDrafts(prev => ({ ...prev, [key]: e.target.value }))}
+            className={`${compact ? "w-16" : "w-20"} bg-[#0b0b0d] border border-zinc-800 focus:border-emerald-500/50 outline-none rounded-lg px-2 py-1 text-[10px] text-zinc-100 font-mono`}
+            aria-label="Raw-Preis in Euro"
+          />
+          <button
+            type="button"
+            onClick={() => handleSaveManualMarketPrice(card)}
+            disabled={saving}
+            title="Raw-Preis speichern"
+            className="h-7 w-7 inline-flex items-center justify-center rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 text-emerald-400 disabled:opacity-50 cursor-pointer transition"
+          >
+            {saving ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+          </button>
+        </div>
+        {previewEur > 0 && (
+          <div className="text-[9px] text-zinc-500 font-mono">Preview: €{previewEur.toFixed(2)} ({formatYenFromEur(previewEur)})</div>
+        )}
+        {errorMsg && <div className="text-[9px] text-red-400 font-mono">{errorMsg}</div>}
+      </div>
+    );
+  };
+
+  const withCardmarketNmFilter = (urlValue: string) => {
+    try {
+      const url = new URL(urlValue);
+      if (!url.searchParams.has("minCondition")) url.searchParams.set("minCondition", "2");
+      return url.toString();
+    } catch {
+      return urlValue;
+    }
+  };
+
+  const getCardmarketLanguageId = (card: any) => {
+    const lang = String(card?.language || "").toUpperCase();
+    if (lang === "JA" || lang === "JP" || lang === "JPN") return "7";
+    if (lang === "DE" || lang === "GER" || lang === "GERMAN") return "3";
+    if (lang === "FR") return "2";
+    if (lang === "ES") return "4";
+    if (lang === "IT") return "5";
+    if (lang === "PT") return "8";
+    if (lang === "KO" || lang === "KR") return "10";
+    if (lang === "ZH" || lang === "CN" || lang === "CHT") return "11";
+    return "1";
+  };
+
+  const buildCardmarketOpenUrl = (card: any) => {
+    try {
+      const url = new URL(withCardmarketNmFilter(card.cardmarket_link || ""));
+      url.searchParams.set("language", getCardmarketLanguageId(card));
+      url.searchParams.set("minCondition", "2");
+      return url.toString();
+    } catch {
+      return card.cardmarket_link || "";
+    }
+  };
+
+  const handleOpenCardmarket = (card: any) => {
+    const cmUrl = buildCardmarketOpenUrl(card);
+    if (cmUrl) window.open(cmUrl, "_blank", "noopener,noreferrer");
+  };
+
+  const marketButtonBase = "h-9 rounded-xl border px-2.5 text-[10px] font-black tracking-tight flex items-center justify-center gap-1.5 transition active:scale-[0.98] whitespace-nowrap";
+  const renderMarketButtons = (card: any, mode: "compact" | "detail" | "table" = "compact") => {
+    const detail = mode === "detail";
+    const table = mode === "table";
+    const wrapperClass = detail
+      ? "grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3.5"
+      : table
+        ? "flex flex-wrap justify-end gap-1.5"
+        : "grid grid-cols-2 gap-1.5";
+    const buttonClass = detail ? `${marketButtonBase} min-h-11 px-3 text-xs justify-between` : marketButtonBase;
+
+    return (
+      <div onClick={(e) => e.stopPropagation()} className={wrapperClass}>
+        <button
+          type="button"
+          onClick={() => handleOpenCardmarket(card)}
+          title="Cardmarket mit NM-Filter öffnen"
+          className={`${buttonClass} bg-teal-950/35 hover:bg-teal-500/10 border-teal-500/20 text-teal-300`}
+        >
+          <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+          <span>CM öffnen</span>
+        </button>
+        <a
+          href={card.ebay_link}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="eBay öffnen"
+          className={`${buttonClass} bg-indigo-950/35 hover:bg-indigo-500/10 border-indigo-500/20 text-indigo-300`}
+        >
+          <ShoppingBag className="w-3.5 h-3.5 shrink-0" />
+          <span>eBay öffnen</span>
+        </a>
+        <a
+          href={card.tcgplayer_link || buildTcgplayerSearchLink(card, activeGame)}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="TCGPlayer öffnen"
+          className={`${buttonClass} bg-sky-950/30 hover:bg-sky-500/10 border-sky-500/20 text-sky-300`}
+        >
+          <CreditCard className="w-3.5 h-3.5 shrink-0" />
+          <span>TCGPlayer öffnen</span>
+        </a>
+        <a
+          href={card.google_link || buildGoogleSearchLink(card, activeGame)}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Google suchen"
+          className={`${buttonClass} bg-zinc-900/75 hover:bg-zinc-800 border-zinc-700/70 text-zinc-200`}
+        >
+          <Search className="w-3.5 h-3.5 shrink-0" />
+          <span>Google suchen</span>
+        </a>
+      </div>
+    );
+  };
+
   const getActiveCardStackAndIndex = () => {
     if (!selectedCard) return { stack: [], index: -1 };
     
@@ -1608,10 +1817,6 @@ export default function App() {
         const valA = a.stats?.highest_price_raw || 0;
         const valB = b.stats?.highest_price_raw || 0;
         return valB - valA;
-      } else if (setListSortOrder === "highest_psa10") {
-        const valA = a.stats?.highest_price_psa10 || 0;
-        const valB = b.stats?.highest_price_psa10 || 0;
-        return valB - valA;
       } else if (setListSortOrder === "total_cards") {
         return (b.total_cards || 0) - (a.total_cards || 0);
       } else { // newest
@@ -1747,11 +1952,11 @@ export default function App() {
 
     ctx.fillStyle = "#a1a1aa";
     ctx.font = "18px system-ui, sans-serif";
-    ctx.fillText("INDEX (PSA 10 POTENZIAL):", 90, 495);
+    ctx.fillText("RAW-PREISDATEN:", 90, 495);
     ctx.fillStyle = "#10b981";
     ctx.font = "bold 38px monospace";
-    const totalPsaStr = (set.stats?.total_value_psa10 || 0).toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " €";
-    ctx.fillText(totalPsaStr, 90, 540);
+    const coverageStr = `${set.stats?.priced_cards_db || 0}/${set.stats?.total_cards_db || set.total_cards || 0}`;
+    ctx.fillText(coverageStr, 90, 540);
 
     ctx.fillStyle = "#a1a1aa";
     ctx.font = "18px system-ui, sans-serif";
@@ -1769,44 +1974,26 @@ export default function App() {
     const highestPriceStr = (set.stats?.highest_price_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 }) + " €";
     ctx.fillText(highestPriceStr, 90, 730);
 
-    // Local evaluation box in canvas
-    const evalKey = `${set.set_code.toUpperCase()}-${set.language.toUpperCase()}`;
-    const evalData = setEvaluations[evalKey];
-    if (evalData) {
-      ctx.fillStyle = "#1a1a1e";
-      ctx.beginPath();
-      ctx.roundRect(85, 770, 390, 200, 16);
-      ctx.fill();
+    ctx.fillStyle = "#1a1a1e";
+    ctx.beginPath();
+    ctx.roundRect(85, 770, 390, 200, 16);
+    ctx.fill();
 
-      ctx.fillStyle = "#a1a1aa";
-      ctx.font = "bold 15px system-ui, sans-serif";
-      ctx.fillText("KI RESELLER VERWERTUNGS-INDEX", 105, 805);
+    ctx.fillStyle = "#a1a1aa";
+    ctx.font = "bold 15px system-ui, sans-serif";
+    ctx.fillText("RAW-MARKTDATEN STATUS", 105, 805);
 
-      ctx.fillStyle = "#10b981";
-      ctx.font = "bold 56px system-ui, sans-serif";
-      ctx.fillText(`TIER ${evalData.tier || "B"}`, 105, 870);
+    ctx.fillStyle = "#10b981";
+    ctx.font = "bold 46px system-ui, sans-serif";
+    ctx.fillText(`${set.stats?.priced_cards_db || 0} KARTEN`, 105, 865);
 
-      ctx.fillStyle = "#ffffff";
-      ctx.font = "bold 18px monospace";
-      ctx.fillText(`Score: ${evalData.score || 70}/100`, 280, 850);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 18px monospace";
+    ctx.fillText(`Quelle: ${set.stats?.price_source || "missing_market_prices"}`, 105, 910);
 
-      ctx.fillStyle = "#a1a1aa";
-      ctx.font = "italic 13px system-ui, sans-serif";
-      const justif = evalData.justification || "";
-      ctx.fillText(`"${justif.slice(0, 48)}..."`, 105, 935);
-    } else {
-      ctx.fillStyle = "#1a1a1e";
-      ctx.beginPath();
-      ctx.roundRect(85, 770, 390, 200, 16);
-      ctx.fill();
-
-      ctx.fillStyle = "#a1a1aa";
-      ctx.font = "bold 15px system-ui, sans-serif";
-      ctx.fillText("KI RESELLER INDEX", 110, 810);
-      ctx.fillStyle = "#71717a";
-      ctx.font = "bold 20px system-ui, sans-serif";
-      ctx.fillText("ZUR ANALYSE AUF REITER KLICKEN", 110, 875);
-    }
+    ctx.fillStyle = "#a1a1aa";
+    ctx.font = "13px system-ui, sans-serif";
+    ctx.fillText("Nur importierte oder manuelle Raw-Preise fließen ein.", 105, 945);
 
     // Right Bento: Top 5 Hottest Cards
     const rightBoxX = 540;
@@ -1839,7 +2026,7 @@ export default function App() {
       ctx.font = "bold 13px monospace";
       ctx.fillText(`#${item.card_number || "???"}  |  ${(item.rarity || "Rare").toUpperCase()}`, rightBoxX + 75, yOffset + 58);
 
-      // PSA10 indicator badge
+      // Raw market badge
       ctx.fillStyle = "#10b981";
       ctx.beginPath();
       ctx.roundRect(rightBoxX + 75, yOffset + 72, 175, 28, 6);
@@ -1847,8 +2034,7 @@ export default function App() {
 
       ctx.fillStyle = "#022c22";
       ctx.font = "bold 13px system-ui, sans-serif";
-      const psa10Text = `PSA 10: ${(item.prices?.psa10 || 0).toLocaleString("de-DE", { maximumFractionDigits: 0 })} €`;
-      ctx.fillText(psa10Text, rightBoxX + 85, yOffset + 91);
+      ctx.fillText("RAW MARKTPREIS", rightBoxX + 85, yOffset + 91);
 
       // Raw market price value representation
       ctx.fillStyle = "#ffffff";
@@ -1960,7 +2146,6 @@ export default function App() {
       const response = await fetch("/api/reset-evaluations", { method: "POST" });
       if (response.ok) {
         setResetEvalSuccessMsg("Alle lokalen Händlerbewertungen für Karten und Sets wurden erfolgreich gelöscht.");
-        setEvaluationDetails(null);
         setSetEvaluations({});
       } else {
         const data = await response.json().catch(() => ({}));
@@ -3024,82 +3209,6 @@ export default function App() {
     }
   }, [terminalLogs]);
 
-  // Fetch reseller evaluation whenever selectedCard is opened
-  const getEstPriceFromScore = (score: number) => {
-    if (score >= 95) return 180;
-    if (score >= 90) return 95;
-    if (score >= 75) return 45;
-    if (score >= 50) return 18;
-    if (score >= 30) return 6;
-    return 1.50;
-  };
-
-  useEffect(() => {
-    if (selectedCard) {
-      setEvaluationDetails(null);
-      setEvaluationError(null);
-      setEvaluationLoading(true);
-      setModalCustomSellPrice(0);
-      fetch(`/api/cards/${selectedCard.api_card_id}/evaluation?language=${encodeURIComponent(selectedCard.language)}`)
-        .then((res) => {
-          if (!res.ok) throw new Error();
-          return res.json();
-        })
-        .then((data) => {
-          if (data.evaluated) {
-            setEvaluationDetails(data.evaluation);
-            setModalCustomSellPrice(getEstPriceFromScore(data.evaluation.score));
-          }
-          if (data.healedCard) {
-            setSelectedCard(data.healedCard);
-            setCards(prev => prev.map(c => c.id === data.healedCard.id ? data.healedCard : c));
-            setInventory(prev => prev.map(item => item.id === data.healedCard.id ? { ...item, ...data.healedCard } : item));
-          }
-        })
-        .catch(() => {})
-        .finally(() => {
-          setEvaluationLoading(false);
-        });
-    } else {
-      setEvaluationDetails(null);
-      setEvaluationError(null);
-      setModalCustomSellPrice(0);
-    }
-  }, [selectedCard]);
-
-  // Method to trigger card evaluation via API
-  const handleEvaluateCard = async (forceEval = false) => {
-    if (!selectedCard) return;
-    setEvaluationLoading(true);
-    setEvaluationError(null);
-    try {
-      const res = await fetch(`/api/cards/${selectedCard.api_card_id}/evaluate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          language: selectedCard.language,
-          force: forceEval
-        })
-      });
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || "Fehler bei der lokalen Händleranalyse.");
-      }
-      const data = await res.json();
-      if (data.evaluated) {
-        setEvaluationDetails(data.evaluation);
-        setModalCustomSellPrice(getEstPriceFromScore(data.evaluation.score));
-      } else {
-        throw new Error("Berechnung nicht erfolgreich.");
-      }
-    } catch (err: any) {
-      console.error(err);
-      setEvaluationError(err.message || "Verbindung zum Server fehlgeschlagen.");
-    } finally {
-      setEvaluationLoading(false);
-    }
-  };
-
   // Method to trigger deterministic local market trend snapshot
   const handleFetchSocialTrends = async () => {
     setTrendsLoading(true);
@@ -3880,7 +3989,6 @@ export default function App() {
                   {/* Tight list-based layout for mobile screens */}
                   <div className="flex flex-col gap-2 md:hidden">
                     {sortedCards.map((card) => {
-                      const prices = getEstimatedCardmarketPrices(card);
                       const cardId = card.api_card_id || card.id;
                       const isFav = isCardFavorited(cardId);
                       
@@ -3948,20 +4056,16 @@ export default function App() {
                             </div>
 
                             {/* Financial values and indicators */}
-                            <div className="flex flex-wrap items-center gap-2 mt-1.5 text-[9px] font-mono">
-                              <span className="text-emerald-400 font-bold bg-emerald-950/20 px-1.5 py-0.2 rounded border border-emerald-500/10 shrink-0">
-                                Est: €{prices.raw.toFixed(2)}
-                              </span>
-                              {prices.psa10 > 0 && (
-                                <span className="text-sky-400 bg-sky-950/10 border border-sky-500/10 px-1 py-0.2 rounded shrink-0">
-                                  PSA 10: €{prices.psa10.toFixed(0)}
-                                </span>
-                              )}
+                            <div className="mt-1.5">
+                              {renderManualPriceEditor(card, "mobile")}
+                            </div>
+                            <div className="mt-2">
+                              {renderMarketButtons(card, "compact")}
                             </div>
                           </div>
 
                           {/* Small Action slot (Favorite indicator) */}
-                          <div className="shrink-0 flex items-center justify-center pl-1">
+                          <div className="shrink-0 flex flex-col items-center justify-center gap-1 pl-1">
                             <button
                               onClick={(e) => {
                                 e.stopPropagation();
@@ -4092,6 +4196,12 @@ export default function App() {
                                 )}
                               </>
                             )}
+                            <div className="mt-2">
+                              {renderManualPriceEditor(card, "grid")}
+                            </div>
+                            <div className="mt-2">
+                              {renderMarketButtons(card, "compact")}
+                            </div>
                           </div>
 
                           <div className="mt-3 border-t border-[#222226] pt-2 flex items-center justify-between text-[10px] text-zinc-400 font-medium">
@@ -4110,7 +4220,7 @@ export default function App() {
               ) : (
                 /* Tabellen-Sicht */
                 <div className="overflow-x-auto bg-[#121214] border border-[#222226] rounded-2xl shadow-xl select-text">
-                  <table className="w-full text-left border-collapse min-w-[700px]">
+                  <table className="w-full text-left border-collapse min-w-[850px]">
                     <thead>
                       <tr className="border-b border-[#222226] bg-[#18181b] text-[10px] font-bold font-display text-zinc-400 uppercase tracking-wider">
                         <th className="py-3 px-4">Karte</th>
@@ -4120,6 +4230,7 @@ export default function App() {
                         <th className="py-3 px-4 text-center">HP</th>
                         <th className="py-3 px-4">Typen</th>
                         <th className="py-3 px-4">Sprache</th>
+                        <th className="py-3 px-4">Raw Preis</th>
                         <th className="py-3 px-4 text-right">Aktionen</th>
                       </tr>
                     </thead>
@@ -4223,8 +4334,12 @@ export default function App() {
                             </span>
                           </td>
 
+                          <td className="py-2.5 px-4">
+                            {renderManualPriceEditor(card, "table")}
+                          </td>
+
                           <td className="py-2.5 px-4 text-right">
-                            <div className="flex justify-end gap-1.5">
+                            <div className="flex justify-end gap-1.5 mb-1.5">
                               <button 
                                 onClick={() => setSelectedCard(card)}
                                 className="bg-zinc-800/60 hover:bg-zinc-700/80 border border-zinc-700/20 hover:border-zinc-700/50 text-zinc-300 px-2.5 py-1 rounded text-[10px] font-semibold transition cursor-pointer"
@@ -4250,16 +4365,8 @@ export default function App() {
                               >
                                 <Heart className={`w-3.5 h-3.5 ${isCardFavorited(card.api_card_id || card.id) ? "fill-red-500 text-red-500" : ""}`} />
                               </button>
-                              <a 
-                                href={card.cardmarket_link}
-                                target="_blank" 
-                                rel="noopener noreferrer"
-                                title="Cardmarket analysieren"
-                                className="bg-[#0f2d32]/50 hover:bg-[#0f2d32]/80 border border-teal-500/10 text-teal-300 p-1.5 rounded transition cursor-pointer"
-                              >
-                                <ExternalLink className="w-3.5 h-3.5" />
-                              </a>
                             </div>
+                            {renderMarketButtons(card, "table")}
                           </td>
                         </tr>
                       ))}
@@ -4371,7 +4478,6 @@ export default function App() {
                       <option value="newest">📅 Neueste Sets zuerst</option>
                       <option value="highest_value">💰 Wert absteigend (Set-Index)</option>
                       <option value="highest_card">🔥 Einzelkarte teuerste (Raw)</option>
-                      <option value="highest_psa10">🎯 Einzelkarte teuerste (PSA 10)</option>
                       <option value="total_cards">🗂️ Kartenanzahl absteigend</option>
                     </select>
                   </div>
@@ -4460,99 +4566,6 @@ export default function App() {
                             </div>
                           </div>
 
-                          {/* Reseller Set-Evaluation Section */}
-                          <div className="mt-4 pt-3.5 border-t border-zinc-800/60 space-y-2.5 bg-[#141416]/40 px-3 py-3 rounded-xl border border-zinc-900">
-                            {(() => {
-                              const evalKey = `${set.set_code.toUpperCase()}-${set.language.toUpperCase()}`;
-                              const evalData = setEvaluations[evalKey];
-                              const loadingEval = setEvaluationsLoading[evalKey];
-                              const errorEval = setEvaluationsErrors[evalKey];
-
-                              if (loadingEval) {
-                                return (
-                                  <div className="space-y-1.5 py-1">
-                                    <div className="flex items-center gap-1.5 text-[10px] text-zinc-400 font-sans">
-                                      <Sparkles className="w-3.5 h-3.5 text-yellow-500 animate-pulse shrink-0" />
-                                      <span className="truncate">Lokale Regeln bewerten Set-Resale Chancen...</span>
-                                    </div>
-                                    <div className="w-full bg-[#1c1c1f] h-1.5 rounded-full overflow-hidden relative">
-                                      <div className="bg-gradient-to-r from-emerald-500 to-amber-500 h-full w-2/3 rounded-full absolute left-0 top-0 animate-pulse"></div>
-                                    </div>
-                                  </div>
-                                );
-                              }
-
-                              if (errorEval) {
-                                return (
-                                  <div className="text-[10px] text-red-400 space-y-1 py-1">
-                                    <p className="leading-snug">Fehler: {errorEval}</p>
-                                    <button
-                                      onClick={() => handleEvaluateSet(set.set_code, set.language, false)}
-                                      className="text-[9px] underline font-bold hover:text-white cursor-pointer"
-                                    >
-                                      Erneut versuchen
-                                    </button>
-                                  </div>
-                                );
-                              }
-
-                              if (evalData) {
-                                return (
-                                  <div className="space-y-2">
-                                    <div className="flex items-center justify-between">
-                                      <div className="flex items-center gap-1.5">
-                                        <span className={`text-[10px] font-black font-display tracking-tight px-1.5 py-0.5 rounded ${
-                                          evalData.tier === 'S' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
-                                          evalData.tier === 'A' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' :
-                                          evalData.tier === 'B' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
-                                          'bg-zinc-800 text-zinc-400 border border-zinc-700/50'
-                                        }`}>
-                                          TIER {evalData.tier}
-                                        </span>
-                                        <span className="text-[10px] text-zinc-400 font-medium font-sans">
-                                          Score: <span className="font-mono text-zinc-200 font-bold">{evalData.score}</span>/100
-                                        </span>
-                                      </div>
-                                      <button
-                                        onClick={() => handleEvaluateSet(set.set_code, set.language, true)}
-                                        className="text-[9px] text-[#a1a1aa] hover:text-white bg-[#1a1a1d] border border-zinc-800 px-1.5 py-0.5 rounded transition cursor-pointer"
-                                        disabled={loadingEval}
-                                      >
-                                        Neu
-                                      </button>
-                                    </div>
-
-                                    <div className="w-full bg-zinc-950/80 h-1.5 p-0.5 rounded-full overflow-hidden border border-zinc-900">
-                                      <div 
-                                        style={{ width: `${evalData.score}%` }}
-                                        className={`h-full rounded-full transition-all duration-700 ${
-                                          evalData.score >= 90 ? 'bg-gradient-to-r from-emerald-500 to-teal-400' :
-                                          evalData.score >= 75 ? 'bg-gradient-to-r from-cyan-500 to-blue-500' :
-                                          evalData.score >= 50 ? 'bg-gradient-to-r from-amber-500 to-yellow-400' :
-                                          'bg-zinc-650'
-                                        }`}
-                                      ></div>
-                                    </div>
-
-                                    <p className="text-[10px] text-zinc-350 leading-relaxed italic border-l border-emerald-500/30 pl-2">
-                                      "{evalData.justification}"
-                                    </p>
-                                  </div>
-                                );
-                              }
-
-                              return (
-                                <button
-                                  onClick={() => handleEvaluateSet(set.set_code, set.language, false)}
-                                  className="w-full flex items-center justify-center gap-1 pb-1.5 pt-1 bg-emerald-500/[0.04] hover:bg-emerald-500/[0.08] text-emerald-400 border border-emerald-500/15 hover:border-emerald-500/30 text-[10px] font-bold rounded-lg transition cursor-pointer shadow-sm"
-                                >
-                                  <Sparkles className="w-3 h-3 text-emerald-400 shrink-0" />
-                                  <span>Händler-Attraktivität bewerten (KI)</span>
-                                </button>
-                              );
-                            })()}
-                          </div>
-
                           {/* Live DB Market Indicators */}
                           {set.stats && (
                             <div className="mt-3.5 bg-zinc-950/40 border border-zinc-850/40 p-3 rounded-xl space-y-2 text-xs">
@@ -4567,8 +4580,8 @@ export default function App() {
                                   <div className="text-[9px] text-amber-500 font-mono">~ {Math.round((set.stats.total_value_raw || 0) * arbitrageExchangeRate).toLocaleString("de-DE")} ¥</div>
                                 </div>
                                 <div className="bg-[#18181b]/60 p-2 rounded-lg border border-zinc-900/40">
-                                  <div className="text-[9px] text-zinc-400">PSA 10 Limit</div>
-                                  <div className="text-emerald-400 font-mono font-bold text-xs mt-0.5">{(set.stats.total_value_psa10 || 0).toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €</div>
+                                  <div className="text-[9px] text-zinc-400">Raw-Preise in DB</div>
+                                  <div className="text-emerald-400 font-mono font-bold text-xs mt-0.5">{set.stats.priced_cards_db || 0} / {set.stats.total_cards_db || 0}</div>
                                   <div className="text-[9px] text-zinc-400 font-mono">DB: {set.stats.total_cards_db || 0} / {set.total_cards || 0} K.</div>
                                 </div>
                               </div>
@@ -4670,9 +4683,9 @@ export default function App() {
                         </div>
 
                         <div className="mt-1">
-                          <span className="text-[7.5px] font-extrabold text-zinc-400 block leading-tight">PSA 10 VALUE:</span>
+                          <span className="text-[7.5px] font-extrabold text-zinc-400 block leading-tight">RAW PREISDATEN:</span>
                           <span className="text-[11px] font-black text-emerald-400 font-mono block tracking-tight mt-0.5 animate-pulse">
-                            {(activeSocialSet.stats?.total_value_psa10 || 0).toLocaleString("de-DE", { minimumFractionDigits: 0 })} €
+                            {activeSocialSet.stats?.priced_cards_db || 0}/{activeSocialSet.stats?.total_cards_db || 0}
                           </span>
                         </div>
 
@@ -4683,21 +4696,10 @@ export default function App() {
                           </span>
                         </div>
 
-                        {/* Reseller evaluation badge inside preview */}
-                        {(() => {
-                          const evalKey = `${activeSocialSet.set_code.toUpperCase()}-${activeSocialSet.language.toUpperCase()}`;
-                          const evalData = setEvaluations[evalKey];
-                          if (evalData) {
-                            return (
-                              <div className="mt-2 bg-[#1c1c1f]/50 p-1.5 rounded border border-zinc-800 text-center flex flex-col justify-center items-center">
-                                <span className="text-[7.5px] text-[#a1a1aa] block leading-none font-bold uppercase">KI RATIO:</span>
-                                <span className="text-[13px] font-black text-emerald-400 block mt-0.5 tracking-tighter leading-none">TIER {evalData.tier}</span>
-                                <span className="text-[7px] text-zinc-500 block font-mono">{evalData.score}/100</span>
-                              </div>
-                            );
-                          }
-                          return null;
-                        })()}
+                        <div className="mt-2 bg-[#1c1c1f]/50 p-1.5 rounded border border-zinc-800 text-center flex flex-col justify-center items-center">
+                          <span className="text-[7.5px] text-[#a1a1aa] block leading-none font-bold uppercase">QUELLE:</span>
+                          <span className="text-[9px] font-black text-emerald-400 block mt-0.5 tracking-tight leading-none uppercase">{activeSocialSet.stats?.price_source || "missing"}</span>
+                        </div>
                       </div>
 
                       {/* Top Pulls list box */}
@@ -4713,7 +4715,7 @@ export default function App() {
                               </div>
                               <div className="text-right shrink-0">
                                 <span className="text-zinc-100 font-mono font-bold block">{(item.prices?.raw || 0).toLocaleString("de-DE", { maximumFractionDigits: 1 })} €</span>
-                                <span className="text-[6.5px] text-emerald-400 font-mono block">PSA10: {Math.round(item.prices?.psa10 || 0)}€</span>
+                                <span className="text-[6.5px] text-emerald-400 font-mono block">RAW</span>
                               </div>
                             </div>
                           ))}
@@ -4754,8 +4756,8 @@ export default function App() {
                         <span className="text-pink-400 font-mono font-black text-sm">{(activeSocialSet.stats?.highest_price_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} €</span>
                       </div>
                       <div>
-                        <span className="text-zinc-500 block text-[10px]">PSA 10 Wert:</span>
-                        <span className="text-emerald-400 font-mono font-black text-sm">{(activeSocialSet.stats?.total_value_psa10 || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} €</span>
+                        <span className="text-zinc-500 block text-[10px]">Raw-Preisdaten:</span>
+                        <span className="text-emerald-400 font-mono font-black text-sm">{activeSocialSet.stats?.priced_cards_db || 0} / {activeSocialSet.stats?.total_cards_db || 0}</span>
                       </div>
                       <div>
                         <span className="text-zinc-500 block text-[10px]">Durchschnittspreis:</span>
@@ -4770,9 +4772,7 @@ export default function App() {
                       <span className="text-xs text-zinc-400 font-bold uppercase font-mono tracking-wider">Instagram Post-Caption</span>
                       <button 
                         onClick={() => {
-                          const evalKey = `${activeSocialSet.set_code.toUpperCase()}-${activeSocialSet.language.toUpperCase()}`;
-                          const evalData = setEvaluations[evalKey];
-                          const captionText = `🦍 TCG PRICE STATS: ${activeSocialSet.english_set_name || activeSocialSet.set_name} (${activeSocialSet.set_code.toUpperCase()}) 🦍\n\n📊 Set Gesamt-Index (Raw): ${(activeSocialSet.stats?.total_value_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} € (~ ${Math.round((activeSocialSet.stats?.total_value_raw || 0) * (arbitrageExchangeRate || 160)).toLocaleString("de-DE")} ¥)\n📈 Gesamt-Wert (PSA 10): ${(activeSocialSet.stats?.total_value_psa10 || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} €\n🔥 Teuerster Pull: ${(activeSocialSet.stats?.highest_price_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} €\n⭐ Reseller-Evaluation: Tier ${evalData?.tier || "Unbewertet"} (Score: ${evalData?.score || "???"}/100)\n\n💡 Berechnet aus ${activeSocialSet.stats?.total_cards_db || 0} indexierten Karten über die Pokecoll Analytics Suite.\n\n#pokemon #pokemontcg #cardmarket #reseller #gorillatcg #investing #tradingcards #tcgcommunity #pokemongo`;
+                          const captionText = `🦍 TCG PRICE STATS: ${activeSocialSet.english_set_name || activeSocialSet.set_name} (${activeSocialSet.set_code.toUpperCase()}) 🦍\n\n📊 Set Gesamt-Index (Raw): ${(activeSocialSet.stats?.total_value_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} € (~ ${Math.round((activeSocialSet.stats?.total_value_raw || 0) * (arbitrageExchangeRate || 160)).toLocaleString("de-DE")} ¥)\n📈 Raw-Preisdaten: ${activeSocialSet.stats?.priced_cards_db || 0}/${activeSocialSet.stats?.total_cards_db || 0} Karten\n🔥 Teuerster Pull: ${(activeSocialSet.stats?.highest_price_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} €\n\n💡 Berechnet aus ${activeSocialSet.stats?.total_cards_db || 0} indexierten Karten über die Pokecoll Analytics Suite.\n\n#pokemon #pokemontcg #cardmarket #reseller #gorillatcg #investing #tradingcards #tcgcommunity #pokemongo`;
                           navigator.clipboard.writeText(captionText);
                           setCopiedCaption(true);
                           setTimeout(() => setCopiedCaption(false), 2000);
@@ -4794,7 +4794,7 @@ export default function App() {
                     </div>
                     
                     <div className="bg-[#09090b] border border-zinc-800 p-2.5 rounded-lg text-[10px] text-zinc-500 font-mono h-24 overflow-y-auto whitespace-pre-wrap select-all">
-                      {`🦍 TCG PRICE STATS: ${activeSocialSet.english_set_name || activeSocialSet.set_name} (${activeSocialSet.set_code.toUpperCase()}) 🦍\n\n📊 Set Gesamt-Index (Raw): ${(activeSocialSet.stats?.total_value_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} €\n📈 Gesamt-Wert (PSA 10): ${(activeSocialSet.stats?.total_value_psa10 || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} €\n🔥 Teuerster Pull: ${(activeSocialSet.stats?.highest_price_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} €\n⭐ Reseller-Evaluation: Tier ${setEvaluations[`${activeSocialSet.set_code.toUpperCase()}-${activeSocialSet.language.toUpperCase()}`]?.tier || "Unbewertet"}`}
+                      {`🦍 TCG PRICE STATS: ${activeSocialSet.english_set_name || activeSocialSet.set_name} (${activeSocialSet.set_code.toUpperCase()}) 🦍\n\n📊 Set Gesamt-Index (Raw): ${(activeSocialSet.stats?.total_value_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} €\n📈 Raw-Preisdaten: ${activeSocialSet.stats?.priced_cards_db || 0}/${activeSocialSet.stats?.total_cards_db || 0} Karten\n🔥 Teuerster Pull: ${(activeSocialSet.stats?.highest_price_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2 })} €`}
                     </div>
                   </div>
 
@@ -6660,8 +6660,14 @@ export default function App() {
       {/* DETAIL MODAL CARD ANALYSIS - NEW DESIGN */}
       {selectedCard && (() => {
         const prices = getEstimatedCardmarketPrices(selectedCard);
-        const displayPrice = selectedGrade === 10 ? prices.psa10 : selectedGrade === 9 ? prices.psa9 : prices.psa8;
-        const multiplier = (displayPrice / (prices.raw || 1)).toFixed(1);
+        const rawMarketKnown = Boolean(prices.isMarketPrice && prices.raw > 0);
+        const rawSourceLabel = rawMarketKnown
+          ? String(prices.source || "market_prices").replaceAll("_", " ")
+          : "Kein Raw-Marktpreis";
+        const platformFeePercent = 12;
+        const netSellPrice = rawMarketKnown ? prices.raw * (1 - platformFeePercent / 100) : 0;
+        const maxBuyEur = rawMarketKnown ? (netSellPrice / (1 + arbitrageTargetMargin / 100) - arbitrageCustomsFee) / (1 + arbitrageImportVat / 100) : 0;
+        const maxBuyYen = Math.max(0, Math.floor(maxBuyEur * arbitrageExchangeRate));
 
         // Dynamic theme customization individually matching the card's element/energy type or character color
         const getCardTheme = () => {
@@ -7003,55 +7009,58 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* THE VALUATION & GRADING DASHBOARD (Symmetrically matched to screenshot) */}
+                {/* Raw market dashboard */}
                 <div className="bg-black/30 border border-zinc-900/40 p-5 rounded-[28px] space-y-4 backdrop-blur-md">
                   <div className="grid grid-cols-2 gap-4">
-                    {/* Left: Raw price */}
                     <div className="bg-[#141418]/60 border border-zinc-900/60 p-3.5 rounded-2xl flex flex-col justify-between shadow-inner">
                       <div>
-                        <span className="text-[9px] font-mono font-bold text-zinc-500 uppercase tracking-widest block">RAW / UNGRADED</span>
-                        <span className="text-[10px] text-zinc-400 mt-1 block font-sans">Richtwert</span>
+                        <span className="text-[9px] font-mono font-bold text-zinc-500 uppercase tracking-widest block">RAW MARKTPREIS</span>
+                        <span className={`text-[10px] mt-1 block font-sans ${rawMarketKnown ? "text-emerald-400" : "text-amber-400"}`}>
+                          {rawMarketKnown ? "Verifiziert/importiert" : "Preis fehlt"}
+                        </span>
                       </div>
-                      <span className="text-xl sm:text-2xl font-black font-mono text-[#7dd3fc] mt-4 block">
-                        €{prices.raw.toFixed(2)}
+                      <span className={`text-xl sm:text-2xl font-black font-mono mt-4 block ${rawMarketKnown ? "text-[#7dd3fc]" : "text-zinc-500"}`}>
+                        {rawMarketKnown ? `€${prices.raw.toFixed(2)}` : "CHECK"}
                       </span>
                     </div>
 
-                    {/* Right: TOP GRADE PSA */}
                     <div className="bg-[#141418]/60 border border-zinc-900/60 p-3.5 rounded-2xl flex flex-col justify-between relative overflow-hidden group shadow-inner">
                       <div>
                         <div className="flex items-center justify-between">
-                          <span className="text-[9px] font-mono font-bold text-zinc-400 uppercase tracking-widest block font-display">PSA GRAD {selectedGrade}</span>
-                          <span className="text-[9px] font-black font-mono bg-rose-500/15 text-rose-400 px-1.5 py-0.5 rounded border border-rose-500/10 inline-block">
-                            x{multiplier}
+                          <span className="text-[9px] font-mono font-bold text-zinc-400 uppercase tracking-widest block font-display">MAX. EINKAUF</span>
+                          <span className={`text-[9px] font-black font-mono px-1.5 py-0.5 rounded border inline-block ${
+                            rawMarketKnown ? "bg-emerald-500/15 text-emerald-400 border-emerald-500/10" : "bg-zinc-800 text-zinc-500 border-zinc-700"
+                          }`}>
+                            RAW
                           </span>
                         </div>
-                        <span className="text-[10px] text-zinc-400 mt-1 block font-sans">Sammlerbewertung</span>
+                        <span className="text-[10px] text-zinc-400 mt-1 block font-sans">{arbitrageTargetMargin}% Zielmarge, inkl. Gebühren</span>
                       </div>
-                      <span className="text-xl sm:text-2xl font-black font-mono text-amber-400 mt-4 block">
-                        €{displayPrice.toFixed(2)}
+                      <span className={`text-xl sm:text-2xl font-black font-mono mt-4 block ${rawMarketKnown ? "text-amber-400" : "text-zinc-500"}`}>
+                        {rawMarketKnown ? `¥${maxBuyYen.toLocaleString("de-DE")}` : "CHECK"}
                       </span>
                     </div>
                   </div>
 
-                  {/* Interactive toggle buttons */}
-                  <div className="bg-[#0b0b0d]/81 border border-zinc-900 px-4 py-3 rounded-2xl flex items-center justify-between shadow-sm">
-                    <span className="text-[10px] font-mono font-bold text-zinc-400 uppercase tracking-wider">Note wählen:</span>
-                    <div className="flex items-center gap-1.5">
-                      {[10, 9, 8].map(g => (
-                        <button
-                          key={g}
-                          onClick={() => setSelectedGrade(g)}
-                          className={`w-9 h-9 rounded-full text-xs font-black transition-all flex items-center justify-center cursor-pointer ${
-                            selectedGrade === g 
-                              ? "bg-amber-500 text-black shadow-lg scale-105 font-display" 
-                              : "bg-[#161619] hover:bg-zinc-800 text-zinc-400 hover:text-white border border-zinc-800"
-                          }`}
-                        >
-                          {g}
-                        </button>
-                      ))}
+                  <div className="bg-[#0b0b0d]/81 border border-zinc-900 px-4 py-3 rounded-2xl flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 shadow-sm">
+                    <div>
+                      <span className="text-[10px] font-mono font-bold text-zinc-400 uppercase tracking-wider block">Preisquelle</span>
+                      <span className="text-[10px] text-zinc-500 block mt-0.5">{rawSourceLabel}</span>
                     </div>
+                    {rawMarketKnown ? (
+                      <span className="text-[10px] font-mono text-zinc-300">
+                        Netto nach Plattformgebühr: <span className="text-emerald-400 font-bold">€{netSellPrice.toFixed(2)}</span>
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-mono text-amber-400">
+                        Marktpreis manuell/importiert nachtragen
+                        {prices.referenceModelRaw ? ` · Interner Hinweis: €${Number(prices.referenceModelRaw).toFixed(2)}` : ""}
+                      </span>
+                    )}
+                  </div>
+                  <div className="bg-[#0b0b0d]/81 border border-zinc-900 px-4 py-3 rounded-2xl shadow-sm">
+                    <span className="text-[10px] font-mono font-bold text-zinc-400 uppercase tracking-wider block mb-2">Raw-Preis bearbeiten</span>
+                    {renderManualPriceEditor(selectedCard, "grid")}
                   </div>
                 </div>
                 {/* Databases specifics table */}
@@ -7116,198 +7125,13 @@ export default function App() {
                 </div>
               </div>
 
-              {/* RIGHT SIDE: Expert AI evaluations, Japan Calculator, Scan verification */}
+              {/* RIGHT SIDE: Market search links, Scan verification */}
               <div className="lg:col-span-6 flex flex-col space-y-5">
                 
                 {/* ACTION CARDS: Market analysis search links */}
                 <div className="bg-[#101013] border border-zinc-900 p-5 rounded-[28px] space-y-3 shadow-sm select-none">
                   <h4 className="text-[9px] font-bold font-display text-zinc-400 tracking-wider uppercase">Automatische Marktanalyse Suchlinks</h4>
-                  
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                    <a 
-                      href={selectedCard.cardmarket_link}
-                      target="_blank" 
-                      rel="noopener noreferrer"
-                      className="bg-[#0f2d32]/60 hover:bg-[#0f2d32]/80 text-[#5eead4] border border-teal-500/10 px-4 py-3 rounded-xl transition active:scale-[0.98] font-bold flex items-center justify-between text-xs cursor-pointer shadow-sm"
-                    >
-                      <span>Auf Cardmarket analysieren</span>
-                      <ExternalLink className="w-3.5 h-3.5 shrink-0" />
-                    </a>
-
-                    <a 
-                      href={selectedCard.ebay_link}
-                      target="_blank" 
-                      rel="noopener noreferrer"
-                      className="bg-[#1e1b4b]/50 hover:bg-[#1e1b4b]/70 text-[#c7d2fe] border border-indigo-500/50 px-4 py-3 rounded-xl transition active:scale-[0.98] font-bold flex items-center justify-between text-xs cursor-pointer shadow-sm"
-                    >
-                      <span>Auf eBay DE suchen</span>
-                      <ExternalLink className="w-3.5 h-3.5 shrink-0" />
-                    </a>
-                  </div>
-                </div>
-
-                {/* AI Reseller evaluation assessment card */}
-                <div className="bg-[#101013] border border-zinc-900 p-5 rounded-[28px] space-y-4">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <TrendingUp className="w-4 h-4 text-emerald-400 font-bold" />
-                      <h4 className="text-[9px] font-bold font-display text-zinc-400 tracking-wider uppercase">
-                        TCG Reseller-Attraktivitätsbewertung (KI)
-                      </h4>
-                    </div>
-                    {evaluationDetails && (
-                      <button
-                        onClick={() => handleEvaluateCard(true)}
-                        disabled={evaluationLoading}
-                        className="text-[10px] text-zinc-400 hover:text-white flex items-center gap-1.5 bg-zinc-900/40 hover:bg-zinc-800 px-2.5 py-1.5 rounded-lg border border-zinc-850 transition disabled:opacity-50 cursor-pointer text-zinc-300"
-                      >
-                        <RefreshCw className={`w-3 h-3 ${evaluationLoading ? 'animate-spin' : ''}`} />
-                        Neu bewerten
-                      </button>
-                    )}
-                  </div>
-
-                  {evaluationLoading ? (
-                    <div className="bg-[#151518] border border-zinc-900 p-6 rounded-2xl flex flex-col items-center justify-center space-y-3 shadow-inner">
-                      <Sparkles className="w-5 h-5 text-yellow-500 animate-bounce" />
-                      <div className="text-xs text-zinc-300 font-medium text-center">
-                        Lokale Regeln bewerten Sammlerliquidität, Stabilität und TCG-Marktwerte...
-                      </div>
-                      <div className="w-full bg-[#0b0b0d] h-1 rounded-full overflow-hidden max-w-xs relative p-0.5 border border-zinc-900">
-                        <div className="bg-gradient-to-r from-emerald-500 to-amber-500 h-full w-2/3 rounded-full absolute left-0 top-0 animate-pulse"></div>
-                      </div>
-                    </div>
-                  ) : evaluationError ? (
-                    <div className="bg-red-500/10 border border-red-500/15 text-red-400 p-4 rounded-xl text-xs flex items-start gap-2 shadow-inner">
-                      <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                      <div>
-                        <span className="font-bold">Fehler bei der Analyse:</span> {evaluationError}
-                        <button 
-                          onClick={() => handleEvaluateCard(false)} 
-                          className="underline block mt-1.5 font-semibold hover:text-white cursor-pointer"
-                        >
-                          Nochmal versuchen
-                        </button>
-                      </div>
-                    </div>
-                  ) : evaluationDetails ? (
-                    <div className="bg-[#151518] border border-zinc-900 p-4 rounded-2xl space-y-4 shadow-inner relative overflow-hidden">
-                      {/* Background radial highlight based on Tier */}
-                      <div className={`absolute -right-10 -bottom-10 w-32 h-32 rounded-full blur-3xl opacity-10 pointer-events-none ${
-                        evaluationDetails.tier === 'S' ? 'bg-emerald-500' :
-                        evaluationDetails.tier === 'A' ? 'bg-cyan-500' :
-                        evaluationDetails.tier === 'B' ? 'bg-amber-500' :
-                        'bg-rose-500'
-                      }`}></div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-12 gap-4 items-center">
-                        {/* Massive Grade Tier badge */}
-                        <div className="sm:col-span-3 flex flex-col items-center justify-center p-3 rounded-2xl bg-[#0b0b0d] border border-zinc-850 min-h-[90px] shadow-sm select-none">
-                          <span className="text-[9px] text-[#71717a] font-mono tracking-wider uppercase font-semibold">TIER</span>
-                          <span className={`text-4xl font-black font-display tracking-tight mt-0.5 ${
-                            evaluationDetails.tier === 'S' ? 'text-emerald-400' :
-                            evaluationDetails.tier === 'A' ? 'text-cyan-400' :
-                            evaluationDetails.tier === 'B' ? 'text-amber-400' :
-                            'text-zinc-400'
-                          }`}>{evaluationDetails.tier}</span>
-                        </div>
-
-                        {/* Score & Gauge bar */}
-                        <div className="sm:col-span-9 space-y-2">
-                          <div className="flex justify-between items-end text-xs">
-                            <span className="text-zinc-400 font-medium font-sans">Attraktivitäts-Score:</span>
-                            <span className="font-mono font-bold text-zinc-200 text-sm">
-                              <span className={`text-base ${
-                                evaluationDetails.score >= 90 ? 'text-[#34d399] font-black' :
-                                evaluationDetails.score >= 75 ? 'text-cyan-400 font-bold' :
-                                evaluationDetails.score >= 50 ? 'text-amber-400 font-bold' :
-                                'text-zinc-500'
-                              }`}>{evaluationDetails.score}</span> / 100
-                            </span>
-                          </div>
-
-                          <div className="w-full bg-[#0b0b0d]/90 border border-zinc-900/60 h-2.5 rounded-full overflow-hidden p-0.5">
-                            <div 
-                              style={{ width: `${evaluationDetails.score}%` }}
-                              className={`h-full rounded-full transition-all duration-1000 ${
-                                evaluationDetails.score >= 90 ? 'bg-gradient-to-r from-emerald-500 to-teal-400' :
-                                evaluationDetails.score >= 75 ? 'bg-gradient-to-r from-cyan-500 to-blue-500' :
-                                evaluationDetails.score >= 50 ? 'bg-gradient-to-r from-amber-500 to-yellow-400' :
-                                'bg-gradient-to-r from-zinc-600 to-zinc-400'
-                              }`}
-                            ></div>
-                          </div>
-
-                          <div className="flex justify-between text-[8px] font-mono text-zinc-500 uppercase tracking-tight">
-                            <span>BULK</span>
-                            <span>SOLIDE (B)</span>
-                            <span>PREMIUM (S/A)</span>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Expert justification block */}
-                      <div className="border-t border-zinc-900 pt-3.5 space-y-1">
-                        <span className="text-[9px] text-[#71717a] font-mono tracking-wider block uppercase font-bold">PROFESSIONELLES FACHURTEIL</span>
-                        <blockquote className="text-xs text-zinc-300 leading-relaxed italic border-l-2 border-emerald-500/30 pl-3">
-                          "${evaluationDetails.justification}"
-                        </blockquote>
-                      </div>
-
-                      {/* Decision support calculator */}
-                      <div className="border-t border-zinc-900 pt-3.5 space-y-2">
-                        <span className="text-[9px] text-[#71717a] font-mono tracking-wider block uppercase font-bold font-display">🇯🇵 IMPORT LIMIT-RECHNER</span>
-                        <p className="text-[10.5px] text-zinc-404 text-zinc-400 leading-normal font-sans">
-                          Einkaufslimit für japanische Stores bei einem Kurs von <span className="text-amber-450 font-semibold font-mono text-amber-400">¥${arbitrageExchangeRate}</span> und Marge von <span className="text-rose-450 font-bold">${arbitrageTargetMargin}%</span>:
-                        </p>
-
-                        <div className="bg-[#0b0b0d] p-3 rounded-xl border border-zinc-900 space-y-3 shadow-inner">
-                          <div className="flex justify-between items-center gap-3">
-                            <label className="text-[10px] text-zinc-500 uppercase font-black tracking-tight font-mono">Ablöse DE Verkaufspreis:</label>
-                            <div className="flex items-center gap-1.5 select-none text-zinc-300">
-                              <span className="text-[11px] text-zinc-500">€</span>
-                              <input 
-                                type="number" 
-                                value={modalCustomSellPrice || ""}
-                                onChange={(e) => setModalCustomSellPrice(parseFloat(e.target.value) || 0)}
-                                className="w-20 bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-0.5 text-xs text-zinc-200 focus:outline-none focus:border-red-500 font-mono text-right font-semibold"
-                              />
-                            </div>
-                          </div>
-
-                          {(() => {
-                            const maxEurCostAllowed = (modalCustomSellPrice / (1 + (arbitrageTargetMargin / 100)) - arbitrageCustomsFee) / (1 + (arbitrageImportVat / 100));
-                            const maxJpyCostAllowed = Math.max(0, Math.round(maxEurCostAllowed * arbitrageExchangeRate));
-
-                            return (
-                              <div className="flex justify-between items-center bg-[#151518] px-3 py-2 rounded-lg border border-zinc-900 select-all font-mono">
-                                <span className="text-[9.5px] font-mono text-zinc-400 uppercase font-bold">Max. Einkauf ¥:</span>
-                                <span className="text-sm font-black text-emerald-400">¥ ${maxJpyCostAllowed.toLocaleString()}</span>
-                              </div>
-                            );
-                          })()}
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="bg-[#131316] border border-zinc-900 p-4 rounded-xl text-center space-y-3.5 shadow-inner">
-                      <div className="flex flex-col items-center space-y-1 select-none">
-                        <Award className="w-6 h-6 text-zinc-500 font-bold" />
-                        <h5 className="text-[11px] font-semibold text-zinc-400">Keine lokalen Händleranalyse vorhanden</h5>
-                        <p className="text-[10.5px] text-[#71717a] max-w-sm leading-relaxed font-sans">
-                          Lokale Liquiditäts- und Margen-Chancenschätzung berechnen.
-                        </p>
-                      </div>
-
-                      <button
-                        onClick={() => handleEvaluateCard(false)}
-                        className="w-full bg-[#10b981]/15 hover:bg-[#10b981]/25 text-[#34d399] border border-[#10b981]/20 hover:border-[#10b981]/40 px-4 py-2.5 rounded-xl transition font-bold text-xs cursor-pointer flex items-center justify-center gap-2 shadow-sm"
-                      >
-                        <Sparkles className="w-4 h-4 text-[#34d399]" />
-                        <span>Händler-Attraktivität berechnen</span>
-                      </button>
-                    </div>
-                  )}
+                  {renderMarketButtons(selectedCard, "detail")}
                 </div>
 
                 {/* Scanned crop analyzer section (only if scanned crop is active) */}
@@ -7366,9 +7190,9 @@ export default function App() {
                 <div className="bg-[#101013] border border-zinc-900 p-4 rounded-[24px] flex gap-3 text-[11px] leading-relaxed">
                   <Info className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
                   <div className="space-y-1">
-                    <span className="font-bold text-zinc-300 block">Verkaufstrends & PSA Preiskalkulation</span>
+                    <span className="font-bold text-zinc-300 block">Raw-Marktpreis & Händlerlimit</span>
                     <p className="text-zinc-400 text-[10.5px]">
-                      Graduierte Trends (PSA 8/9/10) basieren auf verifizierten algorithmischen Heuristiken. Live-Marktdaten können idealerweise durch Klick auf <span className="text-zinc-300 hover:underline">„Auf eBay DE suchen“</span> abgeglichen werden.
+                      Kaufentscheidungen basieren nur auf Raw-Marktpreisen aus Importen oder manuellen Preisen. Fehlt ein Marktpreis, bleibt die Karte auf CHECK und sollte über <span className="text-zinc-300 hover:underline">„Auf Cardmarket analysieren“</span> geprüft werden.
                     </p>
                   </div>
                 </div>
@@ -7541,6 +7365,20 @@ export default function App() {
                               <span>•</span>
                               <span>Sprache: <span className="text-red-400 font-bold uppercase">{item.language}</span></span>
                             </p>
+                          </div>
+                        </div>
+
+                        <div className="mx-4 mb-3 p-3 bg-[#101013]/85 border border-zinc-850 rounded-xl space-y-2 select-text" data-nodrag onClick={(e) => e.stopPropagation()}>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-1">
+                              <CreditCard className="w-3 h-3 text-sky-400" />
+                              Raw-Marktpreis
+                            </span>
+                            <span className="text-[9px] text-zinc-500 font-mono">Verkauf DE</span>
+                          </div>
+                          {renderManualPriceEditor(item, "grid")}
+                          <div className="pt-1">
+                            {renderMarketButtons(item, "compact")}
                           </div>
                         </div>
 
@@ -7815,15 +7653,12 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="block text-zinc-400 font-semibold mb-1">Zustand / Grade</label>
+                  <label className="block text-zinc-400 font-semibold mb-1">Zustand (Raw)</label>
                   <select
                     value={addFavGrade}
                     onChange={(e) => setAddFavGrade(e.target.value)}
                     className="w-full bg-[#1c1c1f] border border-zinc-850 rounded-xl px-3 py-2 text-zinc-200 focus:outline-none focus:border-red-500"
                   >
-                    <option value="PSA 10">PSA 10 Gem Mint</option>
-                    <option value="PSA 9">PSA 9 Mint</option>
-                    <option value="PSA 8">PSA 8 Near Mint-Mint</option>
                     <option value="Near Mint">Near Mint (NM)</option>
                     <option value="Excellent">Excellent (EX)</option>
                     <option value="Good">Good (GD)</option>
