@@ -83,6 +83,12 @@ interface PokemonCard {
   tcgplayer_link?: string;
   market_price_eur?: number;
   manual_market_price_eur?: number;
+  low_price_eur?: number;
+  median_price_eur?: number;
+  average_price_eur?: number;
+  trend_price_eur?: number;
+  max_price_eur?: number;
+  offer_count?: number;
   market_source?: string;
   market_observed_at?: string;
   market_source_url?: string;
@@ -755,7 +761,7 @@ export default function App() {
   }, [activeGame]);
 
   // Navigation
-  const [activeTab, setActiveTab] = useState<"search" | "sets" | "importer" | "scripts" | "database" | "image-explorer" | "inventory" | "trends" | "favorites">("search");
+  const [activeTab, setActiveTab] = useState<"search" | "sets" | "importer" | "scripts" | "database" | "image-explorer" | "inventory" | "favorites">("search");
 
   // Database Stats
   const [stats, setStats] = useState<DBStats>({
@@ -822,6 +828,10 @@ export default function App() {
   const [manualPriceDrafts, setManualPriceDrafts] = useState<Record<string, string>>({});
   const [manualPriceSaving, setManualPriceSaving] = useState<Record<string, boolean>>({});
   const [manualPriceErrors, setManualPriceErrors] = useState<Record<string, string>>({});
+  const [clipboardPriceCard, setClipboardPriceCard] = useState<any | null>(null);
+  const [clipboardPriceText, setClipboardPriceText] = useState("");
+  const [clipboardPriceSaving, setClipboardPriceSaving] = useState(false);
+  const [clipboardPriceError, setClipboardPriceError] = useState("");
   const [sortBy, setSortBy] = useState<"set_name" | "card_number" | "rarity" | "">("");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
 
@@ -877,70 +887,14 @@ export default function App() {
   const [searchLimit, setSearchLimit] = useState(100);
   const [allCardsImport, setAllCardsImport] = useState(true);
 
-  // States for Japan Arbitrage & Social Trends
+  // States for Japan arbitrage calculations
   const [arbitrageExchangeRate, setArbitrageExchangeRate] = useState<number>(165.0);
   const [arbitrageImportVat, setArbitrageImportVat] = useState<number>(19.0);
   const [arbitrageCustomsFee, setArbitrageCustomsFee] = useState<number>(3.0);
   const [arbitrageTargetMargin, setArbitrageTargetMargin] = useState<number>(30.0);
   const [trendsLoading, setTrendsLoading] = useState<boolean>(false);
   const [trendsError, setTrendsError] = useState<string | null>(null);
-  const [trendsList, setTrendsList] = useState<any[]>([
-    {
-      pokemon_name: "Latios & Latias GX (Alt Art - Special Illust.)",
-      japanese_set: "Tag All Stars (SM12a)",
-      card_code: "105/095",
-      hype_score: 98,
-      platforms_driving: ["X.com", "Instagram", "eBay DE", "Hareruya JP"],
-      avg_jpy_cost: 145000,
-      est_eur_sale: 1250,
-      social_sentiment: "Starker Aufwärtstrend (Sehr Edel)",
-      import_tip: "Ein extrem gesuchtes Modern-Artwork. Unbedingt in 'Mint' vor Ort kaufen. Deutsche Sammler zahlen Höchstpreise für zentrierte Exemplare."
-    },
-    {
-      pokemon_name: "Glurak ex SAR (Special Illustration)",
-      japanese_set: "Shiny Treasure ex (SV4a)",
-      card_code: "349/190",
-      hype_score: 93,
-      platforms_driving: ["X.com", "TikTok Japan", "Cardmarket"],
-      avg_jpy_cost: 13500,
-      est_eur_sale: 125,
-      social_sentiment: "Konstant Hohe Liquidität",
-      import_tip: "Glurak ist die liquideste Pokémon-Marke überhaupt. Dreht sich im deutschen Markt innerhalb weniger Tage um."
-    },
-    {
-      pokemon_name: "Pikachu (Master Ball Holo)",
-      japanese_set: "Pokémon 151 (SV2a)",
-      card_code: "151/165",
-      hype_score: 95,
-      platforms_driving: ["TikTok", "Instagram", "Reddit TCG"],
-      avg_jpy_cost: 18000,
-      est_eur_sale: 165,
-      social_sentiment: "Physische Verknappung",
-      import_tip: "Masterball-Holos steigen kontinuierlich, da pro Box nur eine einzige Karte enthalten ist. Sammler wollen Master-Sets vervollständigen."
-    },
-    {
-      pokemon_name: "Feelinara ex SAR (Terastal Fest)",
-      japanese_set: "Terastal Fest (SV8a)",
-      card_code: "126/102",
-      hype_score: 96,
-      platforms_driving: ["X.com", "TikTok Japan", "PokéBeach"],
-      avg_jpy_cost: 9200,
-      est_eur_sale: 95,
-      social_sentiment: "Neuerscheinung Hype",
-      import_tip: "Evoli-Evolutionen besitzen krisensichere Beliebtheit. Die glitzernden Teracrystal-Ränder haben enormen Display-Appeal."
-    },
-    {
-      pokemon_name: "Mew ex SAR",
-      japanese_set: "Pokémon 151 (SV2a)",
-      card_code: "205/165",
-      hype_score: 90,
-      platforms_driving: ["X.com", "Reddit TCG", "Instagram"],
-      avg_jpy_cost: 8500,
-      est_eur_sale: 89,
-      social_sentiment: "Sehr Stabil",
-      import_tip: "Wunderschönes, verspieltes Artwork. Ein Must-Have für jeden Sammler von legendären Generation-1 Pokémon."
-    }
-  ]);
+  const [trendsList, setTrendsList] = useState<any[]>([]);
 
   // Dynamic bottom bar state on mobile scroll (Instagram-style shrink)
   const [isBottomBarVisible, setIsBottomBarVisible] = useState(true);
@@ -1287,10 +1241,53 @@ export default function App() {
     return `¥${Math.round(eur * arbitrageExchangeRate).toLocaleString("de-DE")}`;
   };
 
+  const parseEuroPricesFromText = (text: string) => {
+    const matches = Array.from(String(text || "").matchAll(/(?:(?:€|EUR)\s*)?(\d{1,4}(?:[.\s]\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)\s*(?:€|EUR)|(?:€|EUR)\s*(\d{1,4}(?:[.\s]\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)/gi));
+    return matches
+      .map(match => match[1] || match[2] || "")
+      .map(value => {
+        const compact = value.replace(/\s/g, "");
+        const normalized = compact.includes(",")
+          ? compact.replace(/\./g, "").replace(",", ".")
+          : compact;
+        const price = Number(normalized);
+        return Number.isFinite(price) ? Math.round(price * 100) / 100 : 0;
+      })
+      .filter(price => price > 0 && price < 100000);
+  };
+
+  const getClipboardPriceStats = (text: string) => {
+    const prices = parseEuroPricesFromText(text).sort((a, b) => a - b);
+    if (prices.length === 0) return null;
+    const median = prices.length % 2 === 1
+      ? prices[Math.floor(prices.length / 2)]
+      : (prices[prices.length / 2 - 1] + prices[prices.length / 2]) / 2;
+    const trimCount = prices.length >= 8 ? Math.floor(prices.length * 0.1) : 0;
+    const trimmed = prices.slice(trimCount, prices.length - trimCount);
+    const average = prices.reduce((sum, price) => sum + price, 0) / prices.length;
+    const trimmedAverage = trimmed.reduce((sum, price) => sum + price, 0) / trimmed.length;
+
+    return {
+      count: prices.length,
+      prices,
+      min: prices[0],
+      max: prices[prices.length - 1],
+      median: Math.round(median * 100) / 100,
+      average: Math.round(average * 100) / 100,
+      trimmedAverage: Math.round(trimmedAverage * 100) / 100
+    };
+  };
+
   const applyManualMarketPriceToCard = (card: any, priceRow: any) => ({
     ...card,
     market_price_eur: Number(priceRow?.market_price_eur || 0),
     manual_market_price_eur: Number(priceRow?.market_price_eur || 0),
+    low_price_eur: Number(priceRow?.low_price_eur || 0),
+    median_price_eur: Number(priceRow?.median_price_eur || priceRow?.market_price_eur || 0),
+    average_price_eur: Number(priceRow?.average_price_eur || 0),
+    trend_price_eur: Number(priceRow?.trend_price_eur || 0),
+    max_price_eur: Number(priceRow?.max_price_eur || 0),
+    offer_count: Number(priceRow?.offer_count || 0),
     market_source: priceRow?.source || "manual",
     market_observed_at: priceRow?.observed_at || new Date().toISOString(),
     market_source_url: priceRow?.source_url || ""
@@ -1338,6 +1335,74 @@ export default function App() {
       setManualPriceErrors(prev => ({ ...prev, [key]: err.message || "Speichern fehlgeschlagen." }));
     } finally {
       setManualPriceSaving(prev => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const openClipboardPriceModal = (card: any) => {
+    setClipboardPriceCard(card);
+    setClipboardPriceText("");
+    setClipboardPriceError("");
+  };
+
+  const handleReadClipboardPrices = async () => {
+    setClipboardPriceError("");
+    try {
+      const text = await navigator.clipboard.readText();
+      setClipboardPriceText(text || "");
+    } catch {
+      setClipboardPriceError("Zwischenablage konnte nicht gelesen werden.");
+    }
+  };
+
+  const handleSaveClipboardMarketPrice = async () => {
+    if (!clipboardPriceCard) return;
+    const stats = getClipboardPriceStats(clipboardPriceText);
+    if (!stats) {
+      setClipboardPriceError("Keine Euro-Preise gefunden.");
+      return;
+    }
+
+    setClipboardPriceSaving(true);
+    setClipboardPriceError("");
+
+    try {
+      const response = await fetch("/api/prices/upsert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          api_card_id: clipboardPriceCard.api_card_id,
+          game: String(clipboardPriceCard.game || activeGame).toLowerCase(),
+          market_price_eur: stats.median,
+          low_price_eur: stats.min,
+          median_price_eur: stats.median,
+          average_price_eur: stats.average,
+          trend_price_eur: stats.trimmedAverage,
+          max_price_eur: stats.max,
+          offer_count: stats.count,
+          source: "cardmarket_clipboard",
+          source_url: buildCardmarketOpenUrl(clipboardPriceCard),
+          notes: `Cardmarket Clipboard: n=${stats.count}, min=${stats.min}, median=${stats.median}, avg=${stats.average}, trimmed_avg=${stats.trimmedAverage}, max=${stats.max}`
+        })
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || "Preis konnte nicht gespeichert werden.");
+      }
+
+      const key = getCardPriceKey(clipboardPriceCard);
+      setCards(prev => prev.map(item => String(item.api_card_id) === String(clipboardPriceCard.api_card_id) ? applyManualMarketPriceToCard(item, data.price) : item));
+      setInventory(prev => prev.map(item => String(item.api_card_id) === String(clipboardPriceCard.api_card_id) ? applyManualMarketPriceToCard(item, data.price) : item));
+      setFavorites(prev => prev.map(item => String(item.api_card_id) === String(clipboardPriceCard.api_card_id) ? applyManualMarketPriceToCard(item, data.price) : item));
+      setSelectedCard(prev => prev && String(prev.api_card_id) === String(clipboardPriceCard.api_card_id) ? applyManualMarketPriceToCard(prev, data.price) : prev);
+      setManualPriceDrafts(prev => ({ ...prev, [key]: Number(data.price.market_price_eur || stats.median).toFixed(2) }));
+      setClipboardPriceCard(null);
+      setClipboardPriceText("");
+      fetchSets();
+    } catch (err: any) {
+      setClipboardPriceError(err.message || "Speichern fehlgeschlagen.");
+    } finally {
+      setClipboardPriceSaving(false);
     }
   };
 
@@ -1431,7 +1496,7 @@ export default function App() {
     const detail = mode === "detail";
     const table = mode === "table";
     const wrapperClass = detail
-      ? "grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3.5"
+      ? "flex flex-col gap-2.5"
       : table
         ? "flex flex-wrap justify-end gap-1.5"
         : "grid grid-cols-2 gap-1.5";
@@ -1447,6 +1512,15 @@ export default function App() {
         >
           <ExternalLink className="w-3.5 h-3.5 shrink-0" />
           <span>CM öffnen</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => openClipboardPriceModal(card)}
+          title="Cardmarket-Preise einfügen"
+          className={`${buttonClass} bg-amber-950/25 hover:bg-amber-500/10 border-amber-500/20 text-amber-300`}
+        >
+          <Copy className="w-3.5 h-3.5 shrink-0" />
+          <span>CM Preise</span>
         </button>
         <a
           href={card.ebay_link}
@@ -1478,6 +1552,126 @@ export default function App() {
           <Search className="w-3.5 h-3.5 shrink-0" />
           <span>Google suchen</span>
         </a>
+      </div>
+    );
+  };
+
+  const renderClipboardPriceModal = () => {
+    if (!clipboardPriceCard) return null;
+    const stats = getClipboardPriceStats(clipboardPriceText);
+    const fmt = (value: number) => `${Number(value || 0).toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`;
+
+    return (
+      <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[10000] flex items-center justify-center p-4">
+        <div className="bg-[#121214] border border-[#222226] rounded-3xl max-w-lg w-full p-5 select-text shadow-2xl relative animate-in fade-in zoom-in duration-200">
+          <button
+            type="button"
+            onClick={() => setClipboardPriceCard(null)}
+            className="absolute top-4 right-4 text-zinc-400 hover:text-white bg-white/5 hover:bg-white/10 p-1.5 rounded-lg transition cursor-pointer"
+            title="Schließen"
+          >
+            <X className="w-4 h-4" />
+          </button>
+
+          <div className="pr-10">
+            <div className="text-[10px] font-black uppercase tracking-wider text-amber-300">Cardmarket Preise</div>
+            <h3 className="mt-1 text-sm font-bold text-zinc-100 truncate">{formatCardName(clipboardPriceCard)}</h3>
+            <p className="text-[10px] text-zinc-500 font-mono truncate">
+              {clipboardPriceCard.set_name} · #{clipboardPriceCard.card_number}
+            </p>
+          </div>
+
+          <div className="mt-4 space-y-3">
+            <textarea
+              value={clipboardPriceText}
+              onChange={(e) => {
+                setClipboardPriceText(e.target.value);
+                setClipboardPriceError("");
+              }}
+              rows={7}
+              placeholder={"23,99 €\n24,50 €\n25,00 €"}
+              className="w-full bg-[#0b0b0d] border border-zinc-800 focus:border-amber-500/50 outline-none rounded-2xl px-3 py-2 text-xs text-zinc-100 font-mono resize-none"
+            />
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={handleReadClipboardPrices}
+                className="h-9 rounded-xl border border-zinc-700/70 bg-zinc-900/75 hover:bg-zinc-800 px-3 text-[10px] font-black text-zinc-200 flex items-center gap-1.5 transition"
+              >
+                <Copy className="w-3.5 h-3.5" />
+                <span>Einfügen</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleOpenCardmarket(clipboardPriceCard)}
+                className="h-9 rounded-xl border border-teal-500/20 bg-teal-950/35 hover:bg-teal-500/10 px-3 text-[10px] font-black text-teal-300 flex items-center gap-1.5 transition"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>CM öffnen</span>
+              </button>
+            </div>
+
+            {stats ? (
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                <div className="bg-[#0b0b0d] border border-zinc-850 rounded-xl p-2">
+                  <div className="text-[9px] text-zinc-500 font-mono uppercase">Anzahl</div>
+                  <div className="text-xs text-zinc-100 font-bold">{stats.count}</div>
+                </div>
+                <div className="bg-[#0b0b0d] border border-emerald-500/20 rounded-xl p-2">
+                  <div className="text-[9px] text-emerald-400 font-mono uppercase">Median</div>
+                  <div className="text-xs text-emerald-300 font-bold">{fmt(stats.median)}</div>
+                </div>
+                <div className="bg-[#0b0b0d] border border-zinc-850 rounded-xl p-2">
+                  <div className="text-[9px] text-zinc-500 font-mono uppercase">Ø</div>
+                  <div className="text-xs text-zinc-100 font-bold">{fmt(stats.average)}</div>
+                </div>
+                <div className="bg-[#0b0b0d] border border-zinc-850 rounded-xl p-2">
+                  <div className="text-[9px] text-zinc-500 font-mono uppercase">Min</div>
+                  <div className="text-xs text-zinc-100 font-bold">{fmt(stats.min)}</div>
+                </div>
+                <div className="bg-[#0b0b0d] border border-zinc-850 rounded-xl p-2">
+                  <div className="text-[9px] text-zinc-500 font-mono uppercase">Max</div>
+                  <div className="text-xs text-zinc-100 font-bold">{fmt(stats.max)}</div>
+                </div>
+              </div>
+            ) : (
+              <div className="bg-[#0b0b0d] border border-zinc-850 rounded-xl px-3 py-2 text-[10px] text-zinc-500 font-mono">
+                Keine Euro-Preise erkannt.
+              </div>
+            )}
+
+            {stats && (
+              <div className="text-[9px] text-zinc-500 font-mono leading-relaxed break-words">
+                {stats.prices.slice(0, 16).map(fmt).join(" · ")}
+                {stats.prices.length > 16 ? " · ..." : ""}
+              </div>
+            )}
+
+            {clipboardPriceError && (
+              <div className="text-[10px] text-red-400 font-mono">{clipboardPriceError}</div>
+            )}
+
+            <div className="flex gap-2.5 pt-1">
+              <button
+                type="button"
+                onClick={() => setClipboardPriceCard(null)}
+                className="flex-1 bg-[#1c1c1f] hover:bg-[#27272a] text-zinc-300 py-2.5 rounded-xl text-xs font-semibold transition cursor-pointer border border-zinc-800"
+              >
+                Abbrechen
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveClipboardMarketPrice}
+                disabled={!stats || clipboardPriceSaving}
+                className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white py-2.5 rounded-xl text-xs font-bold transition cursor-pointer disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {clipboardPriceSaving ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                <span>Median speichern</span>
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
     );
   };
@@ -3209,33 +3403,13 @@ export default function App() {
     }
   }, [terminalLogs]);
 
-  // Method to trigger deterministic local market trend snapshot
-  const handleFetchSocialTrends = async () => {
-    setTrendsLoading(true);
+  // Clear filters
+  const handleFetchSocialTrends = () => {
+    setTrendsLoading(false);
     setTrendsError(null);
-    try {
-      const res = await fetch("/api/trends/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" }
-      });
-      if (!res.ok) {
-        throw new Error("Fehler beim Abrufen der Social-Media-Karten-Trends.");
-      }
-      const data = await res.json();
-      if (data && data.trends) {
-        setTrendsList(data.trends);
-      } else {
-        throw new Error("Keine validen Trend-Daten empfangen.");
-      }
-    } catch (err: any) {
-      console.error(err);
-      setTrendsError(err.message || "Fehler beim Laden.");
-    } finally {
-      setTrendsLoading(false);
-    }
+    setTrendsList([]);
   };
 
-  // Clear filters
   const handleClearFilters = () => {
     setFilterName("");
     setFilterSetName("");
@@ -3385,7 +3559,15 @@ export default function App() {
     <div className={`min-h-screen pb-24 md:pb-0 text-[#e4e4e7] font-sans antialiased transition-colors duration-500 ${isPk ? 'bg-[#09090b]' : 'bg-[#030a16]'}`}>
       {/* Header Bar */}
       <header className={`border-b ${isPk ? 'border-[#222226]/80 bg-[#121214]/95' : 'border-slate-800/80 bg-slate-900/90'} backdrop-blur-md sticky top-0 z-40 px-3 py-2 sm:px-6 sm:py-3 flex flex-row justify-between items-center gap-2`}>
-        <div className="flex items-center gap-1.5 sm:gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            setActiveTab("favorites");
+            fetchFavorites();
+          }}
+          className="flex items-center gap-1.5 sm:gap-2 cursor-pointer rounded-xl px-1 py-0.5 hover:bg-white/5 transition"
+          title="Favoriten öffnen"
+        >
           <div className={`p-1.5 rounded-lg flex items-center justify-center ${activeGame === 'pokemon' ? 'bg-[#dc2626]/12 text-[#f87171]' : 'bg-[#f59e0b]/12 text-amber-400'}`}>
             {activeGame === 'pokemon' ? (
               <PokéballIcon className="w-4 h-4 animate-pulse" />
@@ -3398,7 +3580,7 @@ export default function App() {
               {activeGame === 'pokemon' ? 'PokéCollector' : 'BountyCollector'}
             </h1>
           </div>
-        </div>
+        </button>
 
         {/* Condensed Header Navigation */}
         <nav className="flex items-center gap-0.5 bg-[#18181b] p-0.5 sm:p-1 rounded-lg sm:rounded-xl border border-[#27272a] select-none">
@@ -3465,7 +3647,6 @@ export default function App() {
                 {activeTab === "inventory" && `Inventar (${inventory.length})`}
                 {activeTab === "favorites" && `Favoriten (${favorites.length})`}
                 {activeTab === "sets" && `Sets (${stats.total_sets})`}
-                {activeTab === "trends" && "Trends"}
                 {activeTab === "importer" && "Live-Sync"}
                 {activeTab === "scripts" && "Source Code"}
                 {activeTab === "database" && "Datenbank"}
@@ -3553,18 +3734,6 @@ export default function App() {
                   <div className="border-t border-zinc-850/60 my-1 pt-1">
                     <span className="text-[9px] font-mono text-zinc-500 uppercase tracking-wider block px-3 mb-1 font-bold">Tools & Admins</span>
                   </div>
-
-                  <button
-                    onClick={() => handleSelectTab("trends")}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition flex items-center gap-2 cursor-pointer w-full text-left ${
-                      activeTab === "trends" 
-                        ? (activeGame === "pokemon" ? "bg-red-950/40 text-red-400" : "bg-amber-950/40 text-amber-500") 
-                        : "text-zinc-400 hover:text-[#e4e4e7] hover:bg-[#27272a]/30"
-                    }`}
-                  >
-                    <TrendingUp className="w-3.5 h-3.5 text-amber-450" />
-                    <span>Social Trends</span>
-                  </button>
 
                   <button
                     onClick={() => handleSelectTab("importer")}
@@ -4475,10 +4644,8 @@ export default function App() {
                       onChange={(e) => setSetListSortOrder(e.target.value)}
                       className="w-full bg-[#18181b] border border-[#27272a] hover:border-[#ef4444] hover:bg-red-500/5 focus:border-red-500/35 focus:outline-none rounded-xl px-3 py-2.5 text-xs text-amber-500 font-bold cursor-pointer transition"
                     >
-                      <option value="newest">📅 Neueste Sets zuerst</option>
-                      <option value="highest_value">💰 Wert absteigend (Set-Index)</option>
-                      <option value="highest_card">🔥 Einzelkarte teuerste (Raw)</option>
-                      <option value="total_cards">🗂️ Kartenanzahl absteigend</option>
+                      <option value="newest">Neueste Sets zuerst</option>
+                      <option value="total_cards">Kartenanzahl absteigend</option>
                     </select>
                   </div>
 
@@ -4566,31 +4733,6 @@ export default function App() {
                             </div>
                           </div>
 
-                          {/* Live DB Market Indicators */}
-                          {set.stats && (
-                            <div className="mt-3.5 bg-zinc-950/40 border border-zinc-850/40 p-3 rounded-xl space-y-2 text-xs">
-                              <div className="text-[10px] text-zinc-500 uppercase font-mono tracking-widest font-bold flex justify-between items-center">
-                                <span>💰 Set-Marktwertermittlung</span>
-                                <span className="text-emerald-500 font-extrabold animate-pulse text-[8px] bg-emerald-500/10 px-1 rounded">LIVE</span>
-                              </div>
-                              <div className="grid grid-cols-2 gap-2">
-                                <div className="bg-[#18181b]/60 p-2 rounded-lg border border-zinc-900/40">
-                                  <div className="text-[9px] text-zinc-400">Marktwert (Raw)</div>
-                                  <div className="text-zinc-100 font-mono font-bold text-xs mt-0.5">{(set.stats.total_value_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €</div>
-                                  <div className="text-[9px] text-amber-500 font-mono">~ {Math.round((set.stats.total_value_raw || 0) * arbitrageExchangeRate).toLocaleString("de-DE")} ¥</div>
-                                </div>
-                                <div className="bg-[#18181b]/60 p-2 rounded-lg border border-zinc-900/40">
-                                  <div className="text-[9px] text-zinc-400">Raw-Preise in DB</div>
-                                  <div className="text-emerald-400 font-mono font-bold text-xs mt-0.5">{set.stats.priced_cards_db || 0} / {set.stats.total_cards_db || 0}</div>
-                                  <div className="text-[9px] text-zinc-400 font-mono">DB: {set.stats.total_cards_db || 0} / {set.total_cards || 0} K.</div>
-                                </div>
-                              </div>
-                              <div className="flex justify-between items-center text-[10px] font-mono border-t border-zinc-900 pt-1.5 px-0.5">
-                                <span className="text-zinc-500">Hottest Pull (Raw):</span>
-                                <span className="text-rose-400 font-bold">{(set.stats.highest_price_raw || 0).toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €</span>
-                              </div>
-                            </div>
-                          )}
                         </div>
 
                         <div className="mt-5 pt-3 border-t border-[#222226] flex justify-between items-center text-[11px]">
@@ -4598,27 +4740,13 @@ export default function App() {
                             Set-Karten: <span className="font-mono text-zinc-255 font-bold">{set.total_cards}</span>
                           </span>
                           
-                          <div className="flex gap-2 items-center">
-                            <button 
-                              onClick={() => {
-                                setCopiedCaption(false);
-                                setActiveSocialSet(set);
-                              }}
-                              className="px-2.5 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/15 rounded-xl text-[10px] font-bold flex items-center gap-1 transition cursor-pointer"
-                              title="Instagram Social Card für Gorilla TCG generieren"
-                            >
-                              <TrendingUp className="w-3.5 h-3.5" />
-                              Insta-Report
-                            </button>
-
-                            <button 
-                              onClick={() => handleSetClick(set.set_name)}
-                              className="text-[11px] text-red-400 hover:text-red-300 font-bold flex items-center gap-0.5 transition cursor-pointer"
-                            >
-                              Karten anzeigen
-                              <ChevronRight className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
+                          <button 
+                            onClick={() => handleSetClick(set.set_name)}
+                            className="text-[11px] text-red-400 hover:text-red-300 font-bold flex items-center gap-0.5 transition cursor-pointer"
+                          >
+                            Karten anzeigen
+                            <ChevronRight className="w-3.5 h-3.5" />
+                          </button>
                         </div>
                       </div>
                     ))}
@@ -6668,6 +6796,19 @@ export default function App() {
         const netSellPrice = rawMarketKnown ? prices.raw * (1 - platformFeePercent / 100) : 0;
         const maxBuyEur = rawMarketKnown ? (netSellPrice / (1 + arbitrageTargetMargin / 100) - arbitrageCustomsFee) / (1 + arbitrageImportVat / 100) : 0;
         const maxBuyYen = Math.max(0, Math.floor(maxBuyEur * arbitrageExchangeRate));
+        const marketStats = rawMarketKnown
+          ? {
+              count: Number(selectedCard.offer_count || 0),
+              low: Number(selectedCard.low_price_eur || 0),
+              median: Number(selectedCard.median_price_eur || selectedCard.market_price_eur || prices.raw || 0),
+              average: Number(selectedCard.average_price_eur || 0),
+              max: Number(selectedCard.max_price_eur || 0)
+            }
+          : null;
+        const hasMarketStats = Boolean(marketStats && (marketStats.count > 0 || marketStats.low > 0 || marketStats.average > 0 || marketStats.max > 0));
+        const fmtMarketStat = (value: number) => value > 0
+          ? `${value.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`
+          : "-";
 
         // Dynamic theme customization individually matching the card's element/energy type or character color
         const getCardTheme = () => {
@@ -7058,6 +7199,33 @@ export default function App() {
                       </span>
                     )}
                   </div>
+                  {hasMarketStats && marketStats && (
+                    <div className="bg-[#0b0b0d]/81 border border-zinc-900 px-4 py-3 rounded-2xl shadow-sm">
+                      <span className="text-[10px] font-mono font-bold text-zinc-400 uppercase tracking-wider block mb-2">Marktpreis-Info</span>
+                      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-[10px] font-mono">
+                        <div className="bg-[#141418]/70 border border-zinc-850 rounded-xl p-2">
+                          <span className="block text-zinc-500 uppercase text-[8px]">Anzahl</span>
+                          <span className="text-zinc-200 font-bold">{marketStats.count || "-"}</span>
+                        </div>
+                        <div className="bg-[#141418]/70 border border-zinc-850 rounded-xl p-2">
+                          <span className="block text-zinc-500 uppercase text-[8px]">Lowest</span>
+                          <span className="text-zinc-200 font-bold">{fmtMarketStat(marketStats.low)}</span>
+                        </div>
+                        <div className="bg-[#141418]/70 border border-emerald-500/20 rounded-xl p-2">
+                          <span className="block text-emerald-400 uppercase text-[8px]">Median</span>
+                          <span className="text-emerald-300 font-bold">{fmtMarketStat(marketStats.median)}</span>
+                        </div>
+                        <div className="bg-[#141418]/70 border border-zinc-850 rounded-xl p-2">
+                          <span className="block text-zinc-500 uppercase text-[8px]">Average</span>
+                          <span className="text-zinc-200 font-bold">{fmtMarketStat(marketStats.average)}</span>
+                        </div>
+                        <div className="bg-[#141418]/70 border border-zinc-850 rounded-xl p-2">
+                          <span className="block text-zinc-500 uppercase text-[8px]">Max</span>
+                          <span className="text-zinc-200 font-bold">{fmtMarketStat(marketStats.max)}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   <div className="bg-[#0b0b0d]/81 border border-zinc-900 px-4 py-3 rounded-2xl shadow-sm">
                     <span className="text-[10px] font-mono font-bold text-zinc-400 uppercase tracking-wider block mb-2">Raw-Preis bearbeiten</span>
                     {renderManualPriceEditor(selectedCard, "grid")}
@@ -7130,7 +7298,7 @@ export default function App() {
                 
                 {/* ACTION CARDS: Market analysis search links */}
                 <div className="bg-[#101013] border border-zinc-900 p-5 rounded-[28px] space-y-3 shadow-sm select-none">
-                  <h4 className="text-[9px] font-bold font-display text-zinc-400 tracking-wider uppercase">Automatische Marktanalyse Suchlinks</h4>
+                  <h4 className="text-[9px] font-bold font-display text-zinc-400 tracking-wider uppercase">Marktanalyse</h4>
                   {renderMarketButtons(selectedCard, "detail")}
                 </div>
 
@@ -7202,6 +7370,8 @@ export default function App() {
           </div>
         );
       })()}
+
+      {renderClipboardPriceModal()}
 
       {/* TAB 4.6: RESELLER CARD FAVORITES / SHOPPING LIST */}
       {activeTab === "favorites" && (
@@ -7794,14 +7964,6 @@ export default function App() {
             )}
           </div>
           <span className="text-[9px] uppercase tracking-wider font-display font-medium">Favoriten</span>
-        </button>
-
-        <button 
-          onClick={() => setActiveTab("trends")}
-          className={`flex flex-col items-center justify-center gap-1 cursor-pointer transition ${activeTab === "trends" ? "text-[#dc2626] font-extrabold scale-105" : "text-zinc-500 hover:text-white"}`}
-        >
-          <TrendingUp className="w-5 h-5 text-amber-500" />
-          <span className="text-[9px] uppercase tracking-wider font-display font-medium">Trends</span>
         </button>
 
         <button 

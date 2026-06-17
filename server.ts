@@ -1301,7 +1301,11 @@ async function bootstrapDatabase(skipOnePieceSeed = false) {
         game TEXT NOT NULL DEFAULT 'pokemon',
         market_price_eur REAL NOT NULL DEFAULT 0,
         low_price_eur REAL DEFAULT 0,
+        median_price_eur REAL DEFAULT 0,
+        average_price_eur REAL DEFAULT 0,
         trend_price_eur REAL DEFAULT 0,
+        max_price_eur REAL DEFAULT 0,
+        offer_count INTEGER DEFAULT 0,
         source TEXT NOT NULL DEFAULT 'manual',
         source_url TEXT,
         observed_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -1309,6 +1313,10 @@ async function bootstrapDatabase(skipOnePieceSeed = false) {
         UNIQUE(api_card_id, game, source)
       );
     `, []);
+    try { await dbRun("ALTER TABLE market_prices ADD COLUMN median_price_eur REAL DEFAULT 0;", []); } catch (err) {}
+    try { await dbRun("ALTER TABLE market_prices ADD COLUMN average_price_eur REAL DEFAULT 0;", []); } catch (err) {}
+    try { await dbRun("ALTER TABLE market_prices ADD COLUMN max_price_eur REAL DEFAULT 0;", []); } catch (err) {}
+    try { await dbRun("ALTER TABLE market_prices ADD COLUMN offer_count INTEGER DEFAULT 0;", []); } catch (err) {}
     await dbRun("CREATE INDEX IF NOT EXISTS idx_market_prices_card ON market_prices(api_card_id, game);", []);
 
     // In-place database fix to restore correct case-sensitive Japanese card image URLs for tcgdex.net and only lowercase pokemon-card.com URLs
@@ -2610,6 +2618,12 @@ const attachMarketPriceFields = (card: any, market: any) => {
   return {
     ...card,
     market_price_eur: positiveMoney(market.market_price_eur),
+    low_price_eur: positiveMoney(market.low_price_eur),
+    median_price_eur: positiveMoney(market.median_price_eur) || positiveMoney(market.market_price_eur),
+    average_price_eur: positiveMoney(market.average_price_eur),
+    trend_price_eur: positiveMoney(market.trend_price_eur),
+    max_price_eur: positiveMoney(market.max_price_eur),
+    offer_count: Math.max(0, Math.floor(Number(market.offer_count || 0))),
     market_source: market.source || "",
     market_observed_at: market.observed_at || "",
     market_source_url: market.source_url || ""
@@ -2829,6 +2843,7 @@ const TRUSTED_MARKET_PRICE_SOURCES = new Set([
   "cardmarket",
   "cardmarket_api",
   "cardmarket_csv",
+  "cardmarket_clipboard",
   "cardmarket_export",
   "ebay_sold",
   "ebay_sold_csv",
@@ -2881,9 +2896,9 @@ function isTrustedMarketSource(source: any): boolean {
 
 function marketPriority(source: any): number {
   const clean = normalizeMarketSource(source);
-  if (clean === "cardmarket_api" || clean === "cardmarket") return 0;
-  if (clean === "cardmarket_csv" || clean === "cardmarket_export") return 1;
-  if (clean === "manual") return 2;
+  if (clean === "manual") return 0;
+  if (clean === "cardmarket_api" || clean === "cardmarket") return 1;
+  if (clean === "cardmarket_csv" || clean === "cardmarket_clipboard" || clean === "cardmarket_export") return 2;
   if (clean === "ebay_sold" || clean === "ebay_sold_csv") return 3;
   if (TRUSTED_MARKET_PRICE_SOURCES.has(clean)) return 4;
   return 99;
@@ -3030,25 +3045,46 @@ app.get("/api/cards/:api_card_id/pricing", async (req, res) => {
 
 app.post("/api/prices/upsert", async (req, res) => {
   try {
-    const { api_card_id, game = "pokemon", market_price_eur, low_price_eur = 0, trend_price_eur = 0, source = "manual", source_url = "", notes = "" } = req.body || {};
+    const {
+      api_card_id,
+      game = "pokemon",
+      market_price_eur,
+      low_price_eur = 0,
+      median_price_eur = market_price_eur,
+      average_price_eur = 0,
+      trend_price_eur = 0,
+      max_price_eur = 0,
+      offer_count = 0,
+      source = "manual",
+      source_url = "",
+      notes = ""
+    } = req.body || {};
     const cleanSource = normalizeMarketSource(source);
     const marketPrice = positiveMoney(market_price_eur);
     const lowPrice = positiveMoney(low_price_eur);
+    const medianPrice = positiveMoney(median_price_eur) || marketPrice;
+    const averagePrice = positiveMoney(average_price_eur);
     const trendPrice = positiveMoney(trend_price_eur);
+    const maxPrice = positiveMoney(max_price_eur);
+    const offerCount = Math.max(0, Math.min(100000, Math.floor(Number(offer_count) || 0)));
     if (!api_card_id || !marketPrice) return res.status(400).json({ error: "api_card_id und ein positiver market_price_eur sind erforderlich." });
-    if (!isTrustedMarketSource(cleanSource)) return res.status(400).json({ error: "source muss eine echte Preisquelle sein, z.B. manual, cardmarket_csv, cardmarket_api oder ebay_sold. Modell-/Fallback-Preise werden nicht gespeichert." });
+    if (!isTrustedMarketSource(cleanSource)) return res.status(400).json({ error: "source muss eine echte Preisquelle sein, z.B. manual, cardmarket_clipboard, cardmarket_csv, cardmarket_api oder ebay_sold. Modell-/Fallback-Preise werden nicht gespeichert." });
     if (marketPrice > 100000) return res.status(400).json({ error: "market_price_eur wirkt unplausibel hoch und wurde abgelehnt." });
     await dbRun(`
-      INSERT INTO market_prices (api_card_id, game, market_price_eur, low_price_eur, trend_price_eur, source, source_url, observed_at, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+      INSERT INTO market_prices (api_card_id, game, market_price_eur, low_price_eur, median_price_eur, average_price_eur, trend_price_eur, max_price_eur, offer_count, source, source_url, observed_at, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
       ON CONFLICT(api_card_id, game, source) DO UPDATE SET
         market_price_eur = excluded.market_price_eur,
         low_price_eur = excluded.low_price_eur,
+        median_price_eur = excluded.median_price_eur,
+        average_price_eur = excluded.average_price_eur,
         trend_price_eur = excluded.trend_price_eur,
+        max_price_eur = excluded.max_price_eur,
+        offer_count = excluded.offer_count,
         source_url = excluded.source_url,
         observed_at = CURRENT_TIMESTAMP,
         notes = excluded.notes;
-    `, [api_card_id, String(game).toLowerCase(), marketPrice, lowPrice, trendPrice, cleanSource, source_url, notes]);
+    `, [api_card_id, String(game).toLowerCase(), marketPrice, lowPrice, medianPrice, averagePrice, trendPrice, maxPrice, offerCount, cleanSource, source_url, notes]);
     const row = await dbGet("SELECT * FROM market_prices WHERE api_card_id = ? AND game = ? AND source = ?", [api_card_id, String(game).toLowerCase(), cleanSource]);
     res.json({ success: true, price: row });
   } catch (err: any) {
