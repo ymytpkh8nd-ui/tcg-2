@@ -2867,7 +2867,33 @@ const PRINTED_POKEMON_SET_CODE_ALIASES: Record<string, string> = {
   JTG: "sv09",
   DRI: "sv10",
   BLK: "sv10.5b",
-  WHT: "sv10.5w"
+  WHT: "sv10.5w",
+  MEG: "me01",
+  PFL: "me02",
+  ASC: "me02.5",
+  POR: "me03",
+  CRI: "me04"
+};
+
+const POKEMON_OFFICIAL_TOTAL_TO_SET_CODES: Record<string, string[]> = {
+  "064": ["sv06.5"],
+  "086": ["sv10.5b", "sv10.5w", "me04"],
+  "088": ["me03"],
+  "091": ["sv04.5"],
+  "094": ["me02"],
+  "131": ["sv08.5"],
+  "132": ["me01"],
+  "142": ["sv07"],
+  "159": ["sv09"],
+  "162": ["sv05"],
+  "165": ["sv03.5"],
+  "167": ["sv06"],
+  "182": ["sv04", "sv10"],
+  "191": ["sv08"],
+  "193": ["sv02"],
+  "197": ["sv03"],
+  "198": ["sv01"],
+  "217": ["me02.5"]
 };
 
 const MARKET_PRICE_FRESH_DAYS = 14;
@@ -3224,7 +3250,7 @@ app.get("/api/sets", async (req, res) => {
 // GET cards with filters & pagination
 app.get("/api/cards", async (req, res) => {
   try {
-    const { english_name, local_name, set_name, card_number, language, rarity, limit = 50, offset = 0, game = "pokemon" } = req.query;
+    const { english_name, local_name, set_name, card_number, language, rarity, limit = 50, offset = 0, game = "pokemon", include_meta } = req.query;
     
     // Auto-seed/Self-heal One Piece sets/cards if database was reset or cleared
     if (game === "onepiece") {
@@ -3293,8 +3319,8 @@ app.get("/api/cards", async (req, res) => {
       }
     }
     if (set_name) {
-      query += " AND set_name LIKE ?";
-      params.push(`%${set_name}%`);
+      query += " AND (set_name LIKE ? OR UPPER(set_code) = ?)";
+      params.push(`%${set_name}%`, String(set_name).trim().toUpperCase());
     }
     if (card_number) {
       query += " AND card_number = ?";
@@ -3346,35 +3372,46 @@ app.get("/api/cards", async (req, res) => {
       }
     }
 
-    query += " ORDER BY release_date DESC LIMIT ? OFFSET ?";
-    params.push(Number(limit), Number(offset));
+    const includeMeta = String(include_meta || "").toLowerCase() === "true";
+    const fromWhereSql = query.replace(/^SELECT \* /, "");
+    const baseParams = [...params];
+    const onePieceListDedupe = game === "onepiece" && !language;
+    const limitNum = Number(limit);
+    const offsetNum = Math.max(0, Number(offset) || 0);
+    const effectiveLimit = limitNum <= 0 ? 10000 : Math.min(Math.max(1, limitNum || 50), 10000);
+    let total = 0;
 
-    let rows = await dbAll(query, params);
-    
-    // Deduplicate One Piece cards in list view if no explicit language filter is requested
-    if (game === "onepiece" && !language) {
-      const uniqueCards: any[] = [];
-      const seenVariantKeys = new Set<string>();
-      for (const card of rows) {
-        const apiVariantId = String(card.api_card_id || "").replace(/-(en|ja)$/i, "");
-        const variantKey = `${String(card.set_code || "").toUpperCase()}|${apiVariantId || String(card.card_number || "").toUpperCase()}`;
-        if (!seenVariantKeys.has(variantKey)) {
-          seenVariantKeys.add(variantKey);
-          uniqueCards.push(card);
-        } else {
-          // If already seen, but the seen one is JA and this one is EN, we prefer EN entries.
-          const idx = uniqueCards.findIndex(c => {
-            const existingVariantId = String(c.api_card_id || "").replace(/-(en|ja)$/i, "");
-            const existingKey = `${String(c.set_code || "").toUpperCase()}|${existingVariantId || String(c.card_number || "").toUpperCase()}`;
-            return existingKey === variantKey;
-          });
-          if (idx !== -1 && uniqueCards[idx].language === "JA" && card.language === "EN") {
-            uniqueCards[idx] = card;
-          }
-        }
-      }
-      rows = uniqueCards;
+    if (onePieceListDedupe) {
+      const variantKeySql = `UPPER(set_code) || '|' || COALESCE(NULLIF(REPLACE(REPLACE(LOWER(api_card_id), '-en', ''), '-ja', ''), ''), UPPER(card_number))`;
+      const totalRow = await dbGet(
+        `SELECT COUNT(*) as total FROM (SELECT ${variantKeySql} AS variant_key ${fromWhereSql} GROUP BY variant_key)`,
+        baseParams
+      );
+      total = Number(totalRow?.total || 0);
+      query = `
+        SELECT * FROM (
+          SELECT cards.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY ${variantKeySql}
+                   ORDER BY
+                     CASE WHEN UPPER(language) = 'EN' THEN 0 ELSE 1 END,
+                     release_date DESC,
+                     id ASC
+                 ) as __row_rank
+          ${fromWhereSql}
+        )
+        WHERE __row_rank = 1
+        ORDER BY release_date DESC
+        LIMIT ? OFFSET ?
+      `;
+    } else {
+      const totalRow = await dbGet(`SELECT COUNT(*) as total ${fromWhereSql}`, baseParams);
+      total = Number(totalRow?.total || 0);
+      query += " ORDER BY release_date DESC LIMIT ? OFFSET ?";
     }
+    params.push(effectiveLimit, offsetNum);
+
+    const rows = await dbAll(query, params);
 
     const marketRows = rows.length > 0
       ? await dbAll(
@@ -3391,10 +3428,21 @@ app.get("/api/cards", async (req, res) => {
     }
 
     const enrichedRows = rows.map((card: any) => {
-      const market = selectBestMarketPrice(marketByCardId.get(String(card.api_card_id || "")) || []);
-      return enrichCard(attachMarketPriceFields(card, market));
+      const { __row_rank, ...cleanCard } = card;
+      const market = selectBestMarketPrice(marketByCardId.get(String(cleanCard.api_card_id || "")) || []);
+      return enrichCard(attachMarketPriceFields(cleanCard, market));
     });
-    res.json(enrichedRows);
+    if (includeMeta) {
+      res.json({
+        cards: enrichedRows,
+        total,
+        limit: effectiveLimit,
+        offset: offsetNum,
+        has_more: offsetNum + enrichedRows.length < total
+      });
+    } else {
+      res.json(enrichedRows);
+    }
   } catch (err: any) {
     res.status(550).json({ error: err.message });
   }
@@ -3876,6 +3924,7 @@ function guessNamesFromScanText(value: string): string[] {
     "RESISTANCE", "RETREAT", "FLIP", "COINS", "DAMAGE", "HEADS", "EACH", "ATTACK",
     "FURY", "SWIPES", "ILLUS", "ILLUSTRATOR", "NINTENDO", "CREATURES", "GAME",
     "FREAK", "CARD", "CARDS", "THIS", "FOR", "WHEN", "OBJECT", "LOCAL", "OCR",
+    "MANUAL", "LANGUAGE",
     "EN", "DE", "FR", "IT", "ES", "PT"
   ]);
   Object.keys(PRINTED_POKEMON_SET_CODE_ALIASES || {}).forEach(alias => stopWords.add(alias));
@@ -3964,6 +4013,25 @@ function extractStandaloneCardNumbers(value: string): string[] {
   return out;
 }
 
+function extractPrintedCardTotals(value: string): string[] {
+  const out: string[] = [];
+  const rx = /\b\d{1,3}\s*\/\s*(\d{1,3})\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(value || "")) !== null) {
+    const n = parseInt(m[1], 10);
+    if (!Number.isNaN(n) && n >= 30 && n <= 300) {
+      out.push(String(n).padStart(3, "0"));
+    }
+  }
+  return uniqueStrings(out);
+}
+
+function setCodesFromPrintedTotals(totals: string[]): string[] {
+  return uniqueStrings(
+    (totals || []).flatMap(total => POKEMON_OFFICIAL_TOTAL_TO_SET_CODES[String(total).padStart(3, "0")] || [])
+  );
+}
+
 function normalizeSetCodeToken(value: any): string {
   return String(value || "")
     .replace(/\s+/g, "")
@@ -3993,16 +4061,43 @@ function looksLikeJapanesePokemonScan(parsed: any): boolean {
   return /[ぁ-んァ-ン一-龯]/.test(text) || String(parsed?.language || "").toUpperCase() === "JA";
 }
 
+function normalizeScanNameMatchText(value: any): string {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[’']/g, " ")
+    .replace(/[^a-z0-9ぁ-んァ-ンー一-龯]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function rowMatchesScanName(row: any, names: string[]): boolean {
   const haystack = [
     row?.pokemon_name,
     row?.english_name,
     row?.local_name,
     row?.japanese_name
-  ].filter(Boolean).join(" ").toLowerCase();
+  ].filter(Boolean).map(normalizeScanNameMatchText).join(" ").trim();
+  const haystackTokens = new Set(haystack.split(/\s+/).filter(Boolean));
+  const ignoredNameTokens = new Set([
+    "en", "de", "fr", "it", "es", "pt", "jp", "ja",
+    "img", "png", "jpg", "jpeg", "heic", "local", "ocr", "source", "full",
+    "meg", "pre", "dri", "sv", "sm", "xy", "bw", "dp", "adv", "pcg"
+  ]);
+
   return names.some(name => {
-    const clean = String(name || "").toLowerCase().trim();
-    return clean.length >= 3 && haystack.includes(clean);
+    const clean = normalizeScanNameMatchText(name);
+    if (clean.length < 3) return false;
+    if (/[ぁ-んァ-ンー一-龯]/.test(clean)) return haystack.includes(clean);
+
+    const parts = clean
+      .split(/\s+/)
+      .filter(part => part.length >= 3 && !ignoredNameTokens.has(part));
+    if (parts.length === 0) return false;
+
+    return parts.every(part => {
+      if (part.length <= 4) return haystackTokens.has(part);
+      return haystackTokens.has(part) || haystack.includes(part);
+    });
   });
 }
 
@@ -4056,6 +4151,7 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
   const cardNumbers: string[] = [];
   const primaryCardNumbers: string[] = [];
   const names: string[] = [];
+  const printedTotals: string[] = [];
 
   const onePieceCodes = joined.match(/\b(?:OP|ST|EB|PR)[ -]?\d{1,2}\b/gi) || [];
   setCodes.push(...onePieceCodes.map(v => v.replace(/\s+/g, "").replace(/-/g, "").toUpperCase()));
@@ -4068,6 +4164,7 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
   const guessedNames = guessNamesFromScanText([text, hints?.text, hints?.ocrText].filter(Boolean).join("\n"));
 
   const fractional = digitSafeJoined.match(/\b\d{1,3}\s*\/\s*\d{1,3}\b/g) || [];
+  printedTotals.push(...extractPrintedCardTotals(digitSafeJoined));
   for (const num of fractional) {
     const clean = num.replace(/\s+/g, "");
     cardNumbers.push(clean);
@@ -4096,6 +4193,9 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
   }
   if (Array.isArray(hints?.primary_card_numbers)) {
     primaryCardNumbers.push(...hints.primary_card_numbers.map(String));
+  }
+  if (Array.isArray(hints?.printed_set_totals)) {
+    printedTotals.push(...hints.printed_set_totals.map(String));
   }
   if (hints?.set_code) setCodes.push(String(hints.set_code));
   if (Array.isArray(hints?.set_codes)) setCodes.push(...hints.set_codes.map(String));
@@ -4131,10 +4231,17 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
   const hasJapanese = /([ぁ-んァ-ン一-龯])/.test(joined);
   const hasLatinText = /[A-Za-z]{3,}/.test(joined);
   const language = hints?.language || (hasJapanese ? "JA" : (hasLatinText ? "EN" : ""));
+  const totalDerivedSetCodes = setCodesFromPrintedTotals(printedTotals).map(normalizeInternalSetCode);
+  const allSetCodes = uniqueStrings(setCodes.map(normalizeInternalSetCode));
+  const explicitSetCodes = allSetCodes;
+  const totalExplicitIntersection = totalDerivedSetCodes.filter(code => explicitSetCodes.includes(code));
+  const effectiveSetCodes = totalDerivedSetCodes.length > 0
+    ? (totalExplicitIntersection.length > 0 ? totalExplicitIntersection : totalDerivedSetCodes)
+    : allSetCodes;
 
   return {
     text: joined,
-    set_codes: uniqueStrings(setCodes.map(normalizeInternalSetCode)).filter(code => {
+    set_codes: uniqueStrings(effectiveSetCodes).filter(code => {
       const clean = code.replace(/\s+/g, "").toUpperCase();
       if (/^(SV|SM|S|XY|BW|DP|ADV|PCG)$/.test(clean)) return false;
       if (/^(OP|ST|EB|PR)$/.test(clean)) return false;
@@ -4142,6 +4249,7 @@ function parseLocalScanHints(text: string, hints: any = {}, game = "pokemon") {
     }),
     card_numbers: uniqueStrings(cardNumbers),
     primary_card_numbers: uniqueStrings(primaryCardNumbers.length > 0 ? primaryCardNumbers : cardNumbers),
+    printed_set_totals: uniqueStrings(printedTotals),
     names: uniqueStrings(names),
     yen_price: priceCandidates.length ? priceCandidates[0] : 0,
     yellow_label_detected: yellowLabelDetected,
@@ -4203,7 +4311,11 @@ async function findCardsByLocalHints(parsed: any, game = "pokemon"): Promise<any
   const cardNumbers = uniqueStrings((parsed.card_numbers || []).flatMap(cardNumberVariants));
   const primaryCardNumbers = uniqueStrings(((parsed.primary_card_numbers || parsed.card_numbers || []) as any[]).flatMap(cardNumberVariants));
   const lang = (parsed.language || "JA").toUpperCase();
-  const ignoredWords = new Set(["BASIC", "STAGE", "TRAINER", "ENERGY", "POKEMON", "POKÉMON", "CARD", "CARDS", "LOCAL", "OCR", "FULL", "SOURCE", "BOTTOM", "NUMBER", "PRICE", "LOWER", "THIRD"]);
+  const ignoredWords = new Set([
+    "BASIC", "STAGE", "TRAINER", "ENERGY", "POKEMON", "POKÉMON", "CARD", "CARDS",
+    "LOCAL", "OCR", "FULL", "SOURCE", "BOTTOM", "NUMBER", "PRICE", "LOWER", "THIRD",
+    "IMG", "PNG", "JPG", "JPEG", "HEIC", "LANGUAGE", "MEG", "PRE", "DRI", "EN", "DE", "FR", "IT", "ES", "PT"
+  ]);
   const textWords = normalizeScanText(parsed.text || "")
     .split(/[^A-Za-z0-9ぁ-んァ-ンー一-龯]+/)
     .filter(w => w.length >= 3 && !/^\d+$/.test(w) && !ignoredWords.has(w.toUpperCase()))
@@ -4229,6 +4341,7 @@ async function findCardsByLocalHints(parsed: any, game = "pokemon"): Promise<any
 
   for (const passNumbers of setNumberPasses) {
     if (!passNumbers || passNumbers.length === 0) continue;
+    const fallbackExactRows: any[] = [];
     for (const setCode of setCodes) {
       for (const num of passNumbers) {
         const rows = await dbAll(`
@@ -4244,14 +4357,18 @@ async function findCardsByLocalHints(parsed: any, game = "pokemon"): Promise<any
         const nameFilteredRows = searchNames.length > 0
           ? rows.filter((row: any) => rowMatchesScanName(row, searchNames))
           : [];
-        const requireNameForLooseNumber = searchNames.length > 0 && passNumbers.length > 1 && !String(num).includes("/");
+        const requireNameForLooseNumber = searchNames.length > 0 && setCodes.length === 0 && passNumbers.length > 1 && !String(num).includes("/");
         if (requireNameForLooseNumber) {
           addRows(nameFilteredRows, "set_number_exact");
+        } else if (searchNames.length > 0 && nameFilteredRows.length === 0 && rows.length > 0) {
+          fallbackExactRows.push(...rows);
         } else {
           addRows(nameFilteredRows.length > 0 ? nameFilteredRows : rows, "set_number_exact");
         }
       }
     }
+    if (results.length > 0) return results.slice(0, 6);
+    addRows(fallbackExactRows, "set_number_exact");
     if (results.length > 0) return results.slice(0, 6);
   }
 

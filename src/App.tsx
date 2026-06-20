@@ -53,6 +53,9 @@ declare global {
   }
 }
 
+const SCAN_CACHE_NAME = "pokemon-local-scan-results-v15-denominator-match";
+const SCAN_CACHE_KEY_PREFIX = "/api/cards/scan-cache-v15-denominator-match";
+
 // Types matching sqlite representation
 interface PokemonCard {
   id: number;
@@ -244,12 +247,44 @@ const printedPokemonSetCodeAliases: Record<string, string> = {
   JTG: "sv09",
   DRI: "sv10",
   BLK: "sv10.5b",
-  WHT: "sv10.5w"
+  WHT: "sv10.5w",
+  MEG: "me01",
+  PFL: "me02",
+  ASC: "me02.5",
+  POR: "me03",
+  CRI: "me04"
+};
+
+const pokemonOfficialTotalToSetCodes: Record<string, string[]> = {
+  "064": ["sv06.5"],
+  "086": ["sv10.5b", "sv10.5w", "me04"],
+  "088": ["me03"],
+  "091": ["sv04.5"],
+  "094": ["me02"],
+  "131": ["sv08.5"],
+  "132": ["me01"],
+  "142": ["sv07"],
+  "159": ["sv09"],
+  "162": ["sv05"],
+  "165": ["sv03.5"],
+  "167": ["sv06"],
+  "182": ["sv04", "sv10"],
+  "191": ["sv08"],
+  "193": ["sv02"],
+  "197": ["sv03"],
+  "198": ["sv01"],
+  "217": ["me02.5"]
 };
 
 const normalizePrintedSetCode = (value: string) => {
   const clean = String(value || "").replace(/\s+/g, "").toUpperCase();
   return printedPokemonSetCodeAliases[clean] || clean;
+};
+
+const setCodesFromPrintedTotals = (totals: string[]) => {
+  return Array.from(new Set(
+    (totals || []).flatMap(total => pokemonOfficialTotalToSetCodes[String(total).padStart(3, "0")] || [])
+  ));
 };
 
 const extractStandaloneCardNumbers = (value: string) => {
@@ -738,26 +773,7 @@ export default function App() {
   // Save selection on change
   useEffect(() => {
     localStorage.setItem("active_tcg_game", activeGame);
-    setFilterRarities(activeGame === "onepiece" ? [
-      "Leader",
-      "Uncommon",
-      "Rare",
-      "Super Rare",
-      "Secret Rare",
-      "Special Card",
-      "Treasure Rare",
-      "Promo"
-    ] : [
-      "Uncommon",
-      "Rare",
-      "Rare Holo",
-      "Double Rare",
-      "Ultra Rare",
-      "Illustration Rare",
-      "Special Illustration Rare",
-      "Secret Rare",
-      "Hyper Rare"
-    ]);
+    setFilterRarities([]);
   }, [activeGame]);
 
   // Navigation
@@ -777,43 +793,7 @@ export default function App() {
   const [filterCardNum, setFilterCardNum] = useState("");
   const [filterLang, setFilterLang] = useState("");
   const [filterRarity, setFilterRarity] = useState("");
-  const [filterRarities, setFilterRarities] = useState<string[]>(() => {
-    try {
-      const savedGame = (localStorage.getItem("active_tcg_game") as "pokemon" | "onepiece") || "pokemon";
-      return savedGame === "onepiece" ? [
-        "Leader",
-        "Uncommon",
-        "Rare",
-        "Super Rare",
-        "Secret Rare",
-        "Special Card",
-        "Treasure Rare",
-        "Promo"
-      ] : [
-        "Uncommon",
-        "Rare",
-        "Rare Holo",
-        "Double Rare",
-        "Ultra Rare",
-        "Illustration Rare",
-        "Special Illustration Rare",
-        "Secret Rare",
-        "Hyper Rare"
-      ];
-    } catch {
-      return [
-        "Uncommon",
-        "Rare",
-        "Rare Holo",
-        "Double Rare",
-        "Ultra Rare",
-        "Illustration Rare",
-        "Special Illustration Rare",
-        "Secret Rare",
-        "Hyper Rare"
-      ];
-    }
-  });
+  const [filterRarities, setFilterRarities] = useState<string[]>([]);
   const [rarityDropdownOpen, setRarityDropdownOpen] = useState(false);
   const [filterSetQuery, setFilterSetQuery] = useState("");
   const [filterSetLanguage, setFilterSetLanguage] = useState("");
@@ -825,6 +805,12 @@ export default function App() {
 
   // Results & Layout Preferences
   const [cards, setCards] = useState<PokemonCard[]>([]);
+  const [searchMeta, setSearchMeta] = useState<{ total: number; limit: number; offset: number; has_more: boolean }>({
+    total: 0,
+    limit: 100,
+    offset: 0,
+    has_more: false
+  });
   const [manualPriceDrafts, setManualPriceDrafts] = useState<Record<string, string>>({});
   const [manualPriceSaving, setManualPriceSaving] = useState<Record<string, boolean>>({});
   const [manualPriceErrors, setManualPriceErrors] = useState<Record<string, string>>({});
@@ -886,6 +872,19 @@ export default function App() {
   const [viewMode, setViewMode] = useState<"grid" | "table">("grid");
   const [searchLimit, setSearchLimit] = useState(100);
   const [allCardsImport, setAllCardsImport] = useState(true);
+
+  const applyCardsResponse = (payload: any, requestedLimit = searchLimit) => {
+    const list = Array.isArray(payload)
+      ? payload
+      : (Array.isArray(payload?.cards) ? payload.cards : []);
+    setCards(list);
+    setSearchMeta({
+      total: Number(payload?.total ?? list.length) || 0,
+      limit: Number(payload?.limit ?? requestedLimit) || requestedLimit,
+      offset: Number(payload?.offset ?? 0) || 0,
+      has_more: Boolean(payload?.has_more)
+    });
+  };
 
   // States for Japan arbitrage calculations
   const [arbitrageExchangeRate, setArbitrageExchangeRate] = useState<number>(165.0);
@@ -951,7 +950,7 @@ export default function App() {
   const [scanLoading, setScanLoading] = useState(false);
   const [scanResult, setScanResult] = useState<any | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
-  const [turboScan, setTurboScan] = useState<boolean>(true);
+  const [turboScan, setTurboScan] = useState<boolean>(false);
   const [manualScanHint, setManualScanHint] = useState<string>("");
   const [isCameraActive, setIsCameraActive] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -959,6 +958,17 @@ export default function App() {
   const visualCandidateCacheRef = useRef<Record<string, any[]>>({});
   const visualSignatureCacheRef = useRef<Record<string, number[] | null>>({});
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("caches" in window)) return;
+    caches.keys()
+      .then(keys => Promise.all(
+        keys
+          .filter(key => key.startsWith("pokemon-local-scan-results-") && key !== SCAN_CACHE_NAME)
+          .map(key => caches.delete(key))
+      ))
+      .catch(err => console.warn("Alte Scan-Caches konnten nicht bereinigt werden:", err));
+  }, []);
 
   // Live camera analysis states for direct interactive feedback
   const [liveBrightness, setLiveBrightness] = useState<number>(75);
@@ -1560,6 +1570,7 @@ export default function App() {
     if (!clipboardPriceCard) return null;
     const stats = getClipboardPriceStats(clipboardPriceText);
     const fmt = (value: number) => `${Number(value || 0).toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`;
+    const fmtYen = (value: number) => `~ ${formatYenFromEur(Number(value || 0))}`;
 
     return (
       <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[10000] flex items-center justify-center p-4">
@@ -1621,18 +1632,22 @@ export default function App() {
                 <div className="bg-[#0b0b0d] border border-emerald-500/20 rounded-xl p-2">
                   <div className="text-[9px] text-emerald-400 font-mono uppercase">Median</div>
                   <div className="text-xs text-emerald-300 font-bold">{fmt(stats.median)}</div>
+                  <div className="text-[9px] text-amber-400/80 font-mono mt-0.5">{fmtYen(stats.median)}</div>
                 </div>
                 <div className="bg-[#0b0b0d] border border-zinc-850 rounded-xl p-2">
                   <div className="text-[9px] text-zinc-500 font-mono uppercase">Ø</div>
                   <div className="text-xs text-zinc-100 font-bold">{fmt(stats.average)}</div>
+                  <div className="text-[9px] text-amber-400/80 font-mono mt-0.5">{fmtYen(stats.average)}</div>
                 </div>
                 <div className="bg-[#0b0b0d] border border-zinc-850 rounded-xl p-2">
                   <div className="text-[9px] text-zinc-500 font-mono uppercase">Min</div>
                   <div className="text-xs text-zinc-100 font-bold">{fmt(stats.min)}</div>
+                  <div className="text-[9px] text-amber-400/80 font-mono mt-0.5">{fmtYen(stats.min)}</div>
                 </div>
                 <div className="bg-[#0b0b0d] border border-zinc-850 rounded-xl p-2">
                   <div className="text-[9px] text-zinc-500 font-mono uppercase">Max</div>
                   <div className="text-xs text-zinc-100 font-bold">{fmt(stats.max)}</div>
+                  <div className="text-[9px] text-amber-400/80 font-mono mt-0.5">{fmtYen(stats.max)}</div>
                 </div>
               </div>
             ) : (
@@ -2415,7 +2430,7 @@ export default function App() {
     }
   };
 
-  const compressAndResizeImage = (base64Str: string, maxWidth = 1600, maxHeight = 1600): Promise<string> => {
+  const compressAndResizeImage = (base64Str: string, maxWidth = 2400, maxHeight = 2400): Promise<string> => {
     return new Promise((resolve) => {
       if (!base64Str || base64Str.length < 50) {
         resolve(base64Str);
@@ -2424,8 +2439,8 @@ export default function App() {
 
       // Local OCR still needs readable text. Turbo keeps images smaller, but never destroys card numbers.
       if (turboScan) {
-        maxWidth = 1400;
-        maxHeight = 1400;
+        maxWidth = 1900;
+        maxHeight = 1900;
       }
 
       const img = new Image();
@@ -2470,13 +2485,20 @@ export default function App() {
     if (window.Tesseract) return window.Tesseract;
     if (window.__tcgTesseractPromise) return window.__tcgTesseractPromise;
     window.__tcgTesseractPromise = new Promise((resolve) => {
+      let settled = false;
+      const finish = (value: any | null) => {
+        if (settled) return;
+        settled = true;
+        if (!value) window.__tcgTesseractPromise = undefined;
+        resolve(value);
+      };
       const script = document.createElement("script");
       script.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
       script.async = true;
-      script.onload = () => resolve(window.Tesseract || null);
-      script.onerror = () => resolve(null);
+      script.onload = () => finish(window.Tesseract || null);
+      script.onerror = () => finish(null);
       document.head.appendChild(script);
-      setTimeout(() => resolve(window.Tesseract || null), 12000);
+      setTimeout(() => finish(window.Tesseract || null), 12000);
     });
     return window.__tcgTesseractPromise;
   };
@@ -2563,7 +2585,8 @@ export default function App() {
       "BASIC", "STAGE", "TRAINER", "ENERGY", "POKEMON", "POKÉMON", "HP", "WEAKNESS",
       "RESISTANCE", "RETREAT", "FLIP", "COINS", "DAMAGE", "HEADS", "EACH", "ATTACK",
       "FURY", "SWIPES", "ILLUS", "ILLUSTRATOR", "NINTENDO", "CREATURES", "GAME",
-      "FREAK", "CARD", "CARDS", "THIS", "FOR", "WHEN", "OBJECT",
+      "FREAK", "CARD", "CARDS", "THIS", "FOR", "WHEN", "OBJECT", "LOCAL", "OCR",
+      "SOURCE", "IMG", "PNG", "JPG", "JPEG", "HEIC", "MEG", "MANUAL", "LANGUAGE",
       "EN", "DE", "FR", "IT", "ES", "PT"
     ]);
     Object.keys(printedPokemonSetCodeAliases).forEach(alias => stopWords.add(alias));
@@ -2596,6 +2619,7 @@ export default function App() {
     const joined = normalizeOcrForParsing(`${filename || ""}\n${manualScanHint || ""}\n${text || ""}`);
     const cardNumbers: string[] = [];
     const setCodes: string[] = [];
+    const printedSetTotals: string[] = [];
     const prices: number[] = [];
     const names = guessCardNamesFromOcr(`${manualScanHint || ""}\n${text || ""}`);
     const digitSafe = joined.replace(/[OoQ]/g, "0");
@@ -2603,6 +2627,13 @@ export default function App() {
     fractional.forEach(n => {
       const clean = n.replace(/\s+/g, "");
       cardNumbers.push(clean, clean.split("/")[0]);
+      const total = clean.split("/")[1];
+      if (total) {
+        const parsedTotal = parseInt(total, 10);
+        if (!Number.isNaN(parsedTotal) && parsedTotal >= 30 && parsedTotal <= 300) {
+          printedSetTotals.push(String(parsedTotal).padStart(3, "0"));
+        }
+      }
     });
     const opNums = joined.match(/\b(?:OP|ST|EB|PR)\d{2}[- ]?\d{3}\b/gi) || [];
     cardNumbers.push(...opNums.map(v => v.replace(/\s+/g, "").toUpperCase()));
@@ -2639,6 +2670,13 @@ export default function App() {
     const uniq = (arr: string[]) => Array.from(new Set(arr.filter(Boolean).map(v => v.toUpperCase())));
     const hasJapanese = /[ぁ-んァ-ン一-龯]/.test(joined);
     const hasLatinCardText = /[A-Za-z]{3,}/.test(joined);
+    const totalDerivedSetCodes = setCodesFromPrintedTotals(printedSetTotals).map(normalizePrintedSetCode);
+    const allSetCodes = uniq(setCodes.map(normalizePrintedSetCode));
+    const explicitSetCodes = allSetCodes;
+    const totalExplicitIntersection = totalDerivedSetCodes.filter(code => explicitSetCodes.includes(code));
+    const effectiveSetCodes = totalDerivedSetCodes.length > 0
+      ? (totalExplicitIntersection.length > 0 ? totalExplicitIntersection : totalDerivedSetCodes)
+      : allSetCodes;
     return {
       text: joined,
       card_numbers: uniq(cardNumbers),
@@ -2646,11 +2684,12 @@ export default function App() {
         const clean = n.replace(/\s+/g, "");
         return [clean, clean.split("/")[0]];
       }) : cardNumbers),
-      set_codes: uniq(setCodes.map(normalizePrintedSetCode)).filter(code => {
+      set_codes: uniq(effectiveSetCodes).filter(code => {
         const clean = code.replace(/\s+/g, "").toUpperCase();
         if (/^(SV|SM|S|XY|BW|DP|ADV|PCG|OP|ST|EB|PR)$/.test(clean)) return false;
         return clean.length >= 2 && /\d|-P$/.test(clean);
       }),
+      printed_set_totals: uniq(printedSetTotals),
       names,
       yen_price: prices[0] || 0,
       yellow_label_detected: yellowLabel || /黄色|キズ|傷|訳あり/i.test(joined),
@@ -2713,14 +2752,216 @@ export default function App() {
     });
   };
 
+  const orientImageForOcr = async (
+    base64DataUrl: string
+  ): Promise<{ dataUrl: string; rotated: boolean; rotation: 0 | 90 }> => {
+    return new Promise((resolve) => {
+      const original = { dataUrl: base64DataUrl, rotated: false, rotation: 0 as const };
+      const img = new Image();
+      img.onload = () => {
+        if (img.width <= img.height * 1.08) return resolve(original);
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = img.height;
+          canvas.height = img.width;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return resolve(original);
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = "high";
+          ctx.translate(canvas.width, 0);
+          ctx.rotate(Math.PI / 2);
+          ctx.drawImage(img, 0, 0);
+          resolve({ dataUrl: canvas.toDataURL("image/jpeg", 0.92), rotated: true, rotation: 90 });
+        } catch (err) {
+          console.warn("Scanbild konnte nicht automatisch gedreht werden:", err);
+          resolve(original);
+        }
+      };
+      img.onerror = () => resolve(original);
+      img.src = base64DataUrl;
+    });
+  };
+
+  const prepareCardRegionForOcr = async (
+    base64DataUrl: string
+  ): Promise<{ dataUrl: string; detected: boolean; box: { x: number; y: number; w: number; h: number } }> => {
+    return new Promise((resolve) => {
+      const original = { dataUrl: base64DataUrl, detected: false, box: { x: 0, y: 0, w: 1, h: 1 } };
+      const img = new Image();
+      img.onload = () => {
+        if (img.width < 240 || img.height < 240) return resolve(original);
+
+        try {
+          const sampleW = 180;
+          const sampleH = Math.max(220, Math.round((img.height / Math.max(1, img.width)) * sampleW));
+          const sampleCanvas = document.createElement("canvas");
+          sampleCanvas.width = sampleW;
+          sampleCanvas.height = sampleH;
+          const sampleCtx = sampleCanvas.getContext("2d", { willReadFrequently: true });
+          if (!sampleCtx) return resolve(original);
+          sampleCtx.drawImage(img, 0, 0, sampleW, sampleH);
+          const pixels = sampleCtx.getImageData(0, 0, sampleW, sampleH).data;
+          const mask = new Uint8Array(sampleW * sampleH);
+          const rowCounts = new Array(sampleH).fill(0);
+          const yStart = Math.floor(sampleH * 0.20);
+
+          for (let y = yStart; y < sampleH; y++) {
+            for (let x = 0; x < sampleW; x++) {
+              const idx = (y * sampleW + x) * 4;
+              const r = pixels[idx];
+              const g = pixels[idx + 1];
+              const b = pixels[idx + 2];
+              const max = Math.max(r, g, b);
+              const min = Math.min(r, g, b);
+              const brightness = (r + g + b) / 3;
+              const saturation = max === 0 ? 0 : (max - min) / max;
+              const looksLikeCardInk = brightness > 52 && saturation > 0.11;
+              const looksLikeCardPaper = brightness > 122 && saturation < 0.35;
+              const looksLikeHoloOrBorder = brightness > 88 && saturation > 0.045;
+              if (looksLikeCardInk || looksLikeCardPaper || looksLikeHoloOrBorder) {
+                mask[y * sampleW + x] = 1;
+                rowCounts[y]++;
+              }
+            }
+          }
+
+          const rowThreshold = Math.max(14, Math.floor(sampleW * 0.14));
+          const bands: { start: number; end: number; score: number }[] = [];
+          let start = -1;
+          let lastActive = -1;
+          let countSum = 0;
+
+          for (let y = yStart; y < sampleH; y++) {
+            const active = rowCounts[y] >= rowThreshold;
+            if (active) {
+              if (start === -1) {
+                start = y;
+                countSum = 0;
+              }
+              lastActive = y;
+              countSum += rowCounts[y];
+            } else if (start !== -1 && y - lastActive > 4) {
+              const end = lastActive;
+              const height = end - start + 1;
+              if (height >= sampleH * 0.14) {
+                const center = (start + end) / 2 / sampleH;
+                const lowerBias = 1 + Math.max(0, center - 0.35) * 0.55;
+                bands.push({ start, end, score: height * (countSum / height) * lowerBias });
+              }
+              start = -1;
+              lastActive = -1;
+              countSum = 0;
+            }
+          }
+
+          if (start !== -1) {
+            const end = lastActive;
+            const height = end - start + 1;
+            if (height >= sampleH * 0.14) {
+              const center = (start + end) / 2 / sampleH;
+              const lowerBias = 1 + Math.max(0, center - 0.35) * 0.55;
+              bands.push({ start, end, score: height * (countSum / height) * lowerBias });
+            }
+          }
+
+          const bestBand = bands.sort((a, b) => b.score - a.score)[0];
+          if (!bestBand) return resolve(original);
+
+          const bandHeight = bestBand.end - bestBand.start + 1;
+          const colCounts = new Array(sampleW).fill(0);
+          for (let y = bestBand.start; y <= bestBand.end; y++) {
+            for (let x = 0; x < sampleW; x++) {
+              if (mask[y * sampleW + x]) colCounts[x]++;
+            }
+          }
+
+          const colThreshold = Math.max(8, Math.floor(bandHeight * 0.10));
+          const colBands: { start: number; end: number; score: number }[] = [];
+          let xStart = -1;
+          let lastXActive = -1;
+          let xCountSum = 0;
+          for (let x = 0; x < sampleW; x++) {
+            const active = colCounts[x] >= colThreshold;
+            if (active) {
+              if (xStart === -1) {
+                xStart = x;
+                xCountSum = 0;
+              }
+              lastXActive = x;
+              xCountSum += colCounts[x];
+            } else if (xStart !== -1 && x - lastXActive > 3) {
+              const end = lastXActive;
+              const width = end - xStart + 1;
+              if (width >= sampleW * 0.22) colBands.push({ start: xStart, end, score: width * (xCountSum / width) });
+              xStart = -1;
+              lastXActive = -1;
+              xCountSum = 0;
+            }
+          }
+          if (xStart !== -1) {
+            const end = lastXActive;
+            const width = end - xStart + 1;
+            if (width >= sampleW * 0.22) colBands.push({ start: xStart, end, score: width * (xCountSum / width) });
+          }
+
+          const bestColBand = colBands.sort((a, b) => b.score - a.score)[0] || { start: 0, end: sampleW - 1 };
+          const detectedX = (bestColBand.start / sampleW) * img.width;
+          const detectedY = (bestBand.start / sampleH) * img.height;
+          const detectedW = ((bestColBand.end - bestColBand.start + 1) / sampleW) * img.width;
+          const detectedH = ((bestBand.end - bestBand.start + 1) / sampleH) * img.height;
+
+          const padX = Math.max(img.width * 0.035, detectedW * 0.035);
+          const padTop = Math.max(img.height * 0.035, detectedH * 0.10);
+          const padBottom = Math.max(img.height * 0.018, detectedH * 0.035);
+          const sx = Math.max(0, Math.floor(detectedX - padX));
+          const sy = Math.max(0, Math.floor(detectedY - padTop));
+          const ex = Math.min(img.width, Math.ceil(detectedX + detectedW + padX));
+          const ey = Math.min(img.height, Math.ceil(detectedY + detectedH + padBottom));
+          const sw = ex - sx;
+          const sh = ey - sy;
+
+          if (sw < img.width * 0.28 || sh < img.height * 0.28 || sh > img.height * 0.98) {
+            return resolve(original);
+          }
+
+          const maxLongSide = 1700;
+          const ratio = Math.min(1, maxLongSide / Math.max(sw, sh));
+          const outW = Math.max(1, Math.round(sw * ratio));
+          const outH = Math.max(1, Math.round(sh * ratio));
+          const out = document.createElement("canvas");
+          out.width = outW;
+          out.height = outH;
+          const outCtx = out.getContext("2d");
+          if (!outCtx) return resolve(original);
+          outCtx.imageSmoothingEnabled = true;
+          outCtx.imageSmoothingQuality = "high";
+          outCtx.drawImage(img, sx, sy, sw, sh, 0, 0, outW, outH);
+
+          resolve({
+            dataUrl: out.toDataURL("image/jpeg", 0.92),
+            detected: true,
+            box: { x: sx / img.width, y: sy / img.height, w: sw / img.width, h: sh / img.height }
+          });
+        } catch (err) {
+          console.warn("Kartenbereich konnte nicht automatisch zugeschnitten werden:", err);
+          resolve(original);
+        }
+      };
+      img.onerror = () => resolve(original);
+      img.src = base64DataUrl;
+    });
+  };
+
   const buildOcrCrops = async (base64DataUrl: string, mode: "fast" | "name" | "fallback" = "fast") => {
     const fastCrops = [
-      { name: "bottom-id-wide", x: 0.02, y: 0.78, w: 0.78, h: 0.20, scale: 4.2, contrast: 2.2 },
-      { name: "bottom-left-id-tight", x: 0.03, y: 0.84, w: 0.52, h: 0.13, scale: 5.0, contrast: 2.35 },
-      { name: "bottom-footer-id", x: 0.03, y: 0.89, w: 0.58, h: 0.09, scale: 5.2, contrast: 2.45 },
+      { name: "collector-line-full", x: 0.00, y: 0.82, w: 0.86, h: 0.16, scale: 5.2, contrast: 2.5 },
+      { name: "bottom-id-wide", x: 0.02, y: 0.76, w: 0.82, h: 0.22, scale: 4.4, contrast: 2.25 },
+      { name: "bottom-left-id-tight", x: 0.00, y: 0.86, w: 0.58, h: 0.12, scale: 5.4, contrast: 2.55 },
+      { name: "bottom-footer-id", x: 0.00, y: 0.90, w: 0.54, h: 0.08, scale: 5.8, contrast: 2.65 },
       { name: "bottom-right-price", x: 0.55, y: 0.68, w: 0.42, h: 0.24, scale: 3.4, contrast: 1.9 }
     ];
     const nameCrops = [
+      { name: "name-title-strip", x: 0.04, y: 0.00, w: 0.92, h: 0.18, scale: 3.3, contrast: 1.75 },
       { name: "name-top", x: 0.08, y: 0.04, w: 0.82, h: 0.18, scale: 3.0, contrast: 1.65 },
       { name: "name-upper-wide", x: 0.04, y: 0.06, w: 0.92, h: 0.24, scale: 2.6, contrast: 1.55 }
     ];
@@ -2880,7 +3121,13 @@ export default function App() {
     const yellowLabel = await detectYellowLabelFromImage(base64DataUrl);
     let ocrText = "";
     const localDetections: any[] = [];
+    let orientedSource = { dataUrl: base64DataUrl, rotated: false, rotation: 0 as 0 | 90 };
+    let ocrSource = { dataUrl: base64DataUrl, detected: false, box: { x: 0, y: 0, w: 1, h: 1 } };
     try {
+      setScanProgress("Bildausrichtung pruefen...");
+      orientedSource = await orientImageForOcr(base64DataUrl);
+      setScanProgress("Kartenbereich im Foto suchen...");
+      ocrSource = await prepareCardRegionForOcr(orientedSource.dataUrl);
       setScanProgress("Lokale OCR-Engine laden...");
       const Tesseract = await loadTesseract();
       if (Tesseract?.recognize || Tesseract?.createWorker) {
@@ -2919,8 +3166,8 @@ export default function App() {
           }
         };
 
-        setScanProgress("Schneller ID-Scan...");
-        const fastTargets = await buildOcrCrops(base64DataUrl, "fast");
+        setScanProgress(ocrSource.detected ? "Karte zugeschnitten. Schneller ID-Scan..." : "Schneller ID-Scan...");
+        const fastTargets = await buildOcrCrops(ocrSource.dataUrl, "fast");
         await runOcrTargets(fastTargets, "Schneller ID-Scan", true);
 
         const fastHints = parseClientScanHints(texts.join("\n"), filename, yellowLabel, "fast-pass");
@@ -2934,14 +3181,14 @@ export default function App() {
         }
         if (!hasHardId) {
           setScanProgress("Name-OCR als Fallback...");
-          await runOcrTargets(await buildOcrCrops(base64DataUrl, "name"), "Name-OCR");
+          await runOcrTargets(await buildOcrCrops(ocrSource.dataUrl, "name"), "Name-OCR");
         }
 
         const fallbackHints = parseClientScanHints(texts.join("\n"), filename, yellowLabel, "fallback-check");
         const needsFallback = fallbackHints.card_numbers.length === 0 && fallbackHints.set_codes.length === 0 && fallbackHints.names.length === 0;
         if (needsFallback) {
           setScanProgress("OCR-Fallback fuer schwieriges Foto...");
-          await runOcrTargets(await buildOcrCrops(base64DataUrl, "fallback"), "OCR-Fallback");
+          await runOcrTargets(await buildOcrCrops(ocrSource.dataUrl, "fallback"), "OCR-Fallback");
         }
         ocrText = texts.join("\n");
       } else {
@@ -2953,7 +3200,13 @@ export default function App() {
     const hints = parseClientScanHints(ocrText, filename, yellowLabel);
     return {
       ocrText: `${manualScanHint || ""}\n${ocrText}`.trim(),
-      hints,
+      hints: {
+        ...hints,
+        image_rotated_for_ocr: orientedSource.rotated,
+        image_rotation_for_ocr: orientedSource.rotation,
+        card_region_detected: ocrSource.detected,
+        card_region_box: ocrSource.box
+      },
       localDetections: localDetections.length > 0
         ? localDetections
         : [{ text: ocrText, ...hints, bounding_box: { ymin: 80, xmin: 80, ymax: 920, xmax: 920 } }]
@@ -2971,8 +3224,8 @@ export default function App() {
   const getCachedScanResult = async (filename: string, base64Data: string): Promise<any | null> => {
     try {
       if (typeof window !== "undefined" && "caches" in window) {
-        const cache = await caches.open("pokemon-local-scan-results-v10-id-first");
-        const cacheKey = `/api/cards/scan-cache-v10-id-first?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
+        const cache = await caches.open(SCAN_CACHE_NAME);
+        const cacheKey = `${SCAN_CACHE_KEY_PREFIX}?game=${encodeURIComponent(activeGame)}&file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
         const cachedResponse = await cache.match(cacheKey);
         if (cachedResponse) {
           console.log(`Scan-Cache-Treffer für "${filename}" (${base64Data.length} Bytes). Lade sofort lokal!`);
@@ -2987,13 +3240,16 @@ export default function App() {
 
   const setCachedScanResult = async (filename: string, base64Data: string, data: any): Promise<void> => {
     try {
-      if (typeof window !== "undefined" && "caches" in window && data && data.success) {
-        const cache = await caches.open("pokemon-local-scan-results-v10-id-first");
-        const cacheKey = `/api/cards/scan-cache-v10-id-first?file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
+      const hasReliableMatch = Array.isArray(data?.matched_cards) && data.matched_cards.length > 0;
+      if (typeof window !== "undefined" && "caches" in window && data && data.success && hasReliableMatch) {
+        const cache = await caches.open(SCAN_CACHE_NAME);
+        const cacheKey = `${SCAN_CACHE_KEY_PREFIX}?game=${encodeURIComponent(activeGame)}&file=${encodeURIComponent(filename)}&manual=${encodeURIComponent(manualScanHint.slice(0, 120))}&size=${base64Data.length}&hash=${base64Data.slice(0, 50) + base64Data.slice(-50)}`;
         await cache.put(cacheKey, new Response(JSON.stringify(data), {
           headers: { "Content-Type": "application/json" }
         }));
         console.log(`Scan-Ergebnis für "${filename}" erfolgreich im Client-Cache archiviert!`);
+      } else if (data?.success && !hasReliableMatch) {
+        console.log(`Scan-Ergebnis für "${filename}" ohne sicheren Treffer wird nicht gecacht.`);
       }
     } catch (err) {
       console.warn("Fehler beim Speichern im Scan-Cache:", err);
@@ -3020,6 +3276,19 @@ export default function App() {
       .sort((a, b) => b.rank - a.rank)
       .find(({ card, rank }) => rank >= 80 || String(card.scanner_source || "").includes("filename"))
       ?.card || null;
+  };
+
+  const buildScanFailureMessage = (data: any) => {
+    const hints = data?.parsed_hints || data?.client_hints || {};
+    const setCodes = Array.isArray(hints.set_codes) && hints.set_codes.length > 0 ? hints.set_codes.join(", ") : "keine";
+    const numbers = Array.isArray(hints.card_numbers) && hints.card_numbers.length > 0 ? hints.card_numbers.join(", ") : "keine";
+    const names = Array.isArray(hints.names) && hints.names.length > 0 ? hints.names.join(", ") : "keine";
+    const ocrText = String(data?.client_ocr_text || data?.ocrText || hints.text || "").trim();
+    const ocrWasEmpty = ocrText.length < 12 || !/[A-Za-z0-9ぁ-んァ-ン一-龯]/.test(ocrText);
+    if (ocrWasEmpty) {
+      return "Keine sichere Karte erkannt. Die OCR hat keinen brauchbaren Text gelesen. Bitte unten im Feld Set/Nummer eintragen, z.B. DRI 190/182 oder sv10 190, und erneut scannen.";
+    }
+    return `Keine sichere Karte erkannt. Gelesen: Set ${setCodes}, Nr. ${numbers}, Name ${names}. Bitte Set/Nummer unten manuell ergänzen oder Footer schärfer aufnehmen.`;
   };
 
   const createSwipeCard = (card: any, sourceImage: string, index = 0) => {
@@ -3103,6 +3372,12 @@ export default function App() {
         }
 
         let data = await r.json();
+        data = {
+          ...data,
+          client_ocr_text: localPayload.ocrText,
+          client_hints: localPayload.hints,
+          client_local_detections: localPayload.localDetections
+        };
         data = await applyVisualFallback(data, base64DataUrl);
         await setCachedScanResult(currentFilename, base64Data, data);
         scanResults.push(data);
@@ -3126,8 +3401,12 @@ export default function App() {
         success: true,
         match: allMatchedCards.length > 0,
         matched_cards: allMatchedCards,
-        ai_identifications: allAiIdentifications
+        ai_identifications: allAiIdentifications,
+        raw_scan_results: scanResults
       });
+      if (allMatchedCards.length === 0 && scanResults.length > 0) {
+        setScanError(buildScanFailureMessage(scanResults[0]));
+      }
       
       setSwipeDeck(prev => [...prev, ...allMatchedCards]);
       setScanProgress("");
@@ -3202,6 +3481,12 @@ export default function App() {
         }
 
         data = await r.json();
+        data = {
+          ...data,
+          client_ocr_text: localPayload.ocrText,
+          client_hints: localPayload.hints,
+          client_local_detections: localPayload.localDetections
+        };
         data = await applyVisualFallback(data, finalBase64);
         await setCachedScanResult(filename, base64Data, data);
       }
@@ -3213,7 +3498,7 @@ export default function App() {
           setSwipeDeck(prev => [...prev, createSwipeCard(bestCard, finalBase64, 0)]);
         }
       } else if (data.success) {
-        setScanError("Keine Pokémon-Karte erkannt. Bitte stellen Sie sicher, dass die Karte gut beleuchtet und flach fotografiert ist, und versuchen Sie es erneut.");
+        setScanError(buildScanFailureMessage(data));
       }
       setScanProgress("");
     } catch (err: any) {
@@ -3336,7 +3621,15 @@ export default function App() {
   };
 
   // Advanced Search cards trigger
-  const handleSearch = async (e?: React.FormEvent, customLimit?: number, raritiesOverride?: string[], overrideName?: string) => {
+  const handleSearch = async (
+    e?: React.FormEvent,
+    customLimit?: number,
+    raritiesOverride?: string[],
+    overrideName?: string,
+    overrideSetName?: string,
+    overrideLanguage?: string,
+    overrideCardNumber?: string
+  ) => {
     if (e) e.preventDefault();
     setRarityDropdownOpen(false);
     setLoading(true);
@@ -3344,24 +3637,29 @@ export default function App() {
     try {
       const params = new URLSearchParams();
       const activeName = overrideName !== undefined ? overrideName : filterName;
+      const activeSetName = overrideSetName !== undefined ? overrideSetName : filterSetName;
+      const activeLanguage = overrideLanguage !== undefined ? overrideLanguage : filterLang;
+      const activeCardNumber = overrideCardNumber !== undefined ? overrideCardNumber : filterCardNum;
+      const effectiveLimit = customLimit ?? searchLimit;
       if (activeName) params.append("local_name", activeName);
-      if (filterSetName) params.append("set_name", filterSetName);
-      if (filterCardNum) params.append("card_number", filterCardNum);
-      if (filterLang) params.append("language", filterLang);
+      if (activeSetName) params.append("set_name", activeSetName);
+      if (activeCardNumber) params.append("card_number", activeCardNumber);
+      if (activeLanguage) params.append("language", activeLanguage);
       
       const activeRarities = raritiesOverride !== undefined ? raritiesOverride : filterRarities;
       if (activeRarities.length > 0) {
         params.append("rarity", activeRarities.join(","));
-      } else if (filterRarity) {
+      } else if (raritiesOverride === undefined && filterRarity) {
         params.append("rarity", filterRarity);
       }
-      params.append("limit", String(customLimit || searchLimit));
+      params.append("limit", String(effectiveLimit));
+      params.append("include_meta", "true");
       params.append("game", activeGame);
 
       const res = await fetch(`/api/cards?${params.toString()}`);
       if (!res.ok) throw new Error("Suchanfrage fehlgeschlagen");
       const data = await res.json();
-      setCards(data);
+      applyCardsResponse(data, effectiveLimit);
     } catch (err: any) {
       setError(err.message || "Fehler beim Laden der Karten");
     } finally {
@@ -3373,27 +3671,7 @@ export default function App() {
   useEffect(() => {
     fetchStats();
     fetchSets();
-    const defaults = activeGame === "onepiece" ? [
-      "Leader",
-      "Uncommon",
-      "Rare",
-      "Super Rare",
-      "Secret Rare",
-      "Special Card",
-      "Treasure Rare",
-      "Promo"
-    ] : [
-      "Uncommon",
-      "Rare",
-      "Rare Holo",
-      "Double Rare",
-      "Ultra Rare",
-      "Illustration Rare",
-      "Special Illustration Rare",
-      "Secret Rare",
-      "Hyper Rare"
-    ];
-    handleSearch(undefined, undefined, defaults);
+    handleSearch(undefined, undefined, []);
   }, [activeGame]);
 
   // Update terminal auto-scrolling
@@ -3416,26 +3694,7 @@ export default function App() {
     setFilterCardNum("");
     setFilterLang("");
     setFilterRarity("");
-    setFilterRarities(activeGame === "onepiece" ? [
-      "Leader",
-      "Uncommon",
-      "Rare",
-      "Super Rare",
-      "Secret Rare",
-      "Special Card",
-      "Treasure Rare",
-      "Promo"
-    ] : [
-      "Uncommon",
-      "Rare",
-      "Rare Holo",
-      "Double Rare",
-      "Ultra Rare",
-      "Illustration Rare",
-      "Special Illustration Rare",
-      "Secret Rare",
-      "Hyper Rare"
-    ]);
+    setFilterRarities([]);
   };
 
   // View all cards stored in the database immediately
@@ -3446,35 +3705,17 @@ export default function App() {
     setFilterCardNum("");
     setFilterLang("");
     setFilterRarity("");
-    setFilterRarities(activeGame === "onepiece" ? [
-      "Leader",
-      "Uncommon",
-      "Rare",
-      "Super Rare",
-      "Secret Rare",
-      "Special Card",
-      "Treasure Rare",
-      "Promo"
-    ] : [
-      "Uncommon",
-      "Rare",
-      "Rare Holo",
-      "Double Rare",
-      "Ultra Rare",
-      "Illustration Rare",
-      "Special Illustration Rare",
-      "Secret Rare",
-      "Hyper Rare"
-    ]);
+    setFilterRarities([]);
+    setSearchLimit(0);
     setLoading(true);
     setError(null);
-    fetch(`/api/cards?limit=250&game=${activeGame}`)
+    fetch(`/api/cards?limit=0&include_meta=true&game=${activeGame}`)
       .then((res) => {
         if (!res.ok) throw new Error("Fehler beim Laden");
         return res.json();
       })
       .then((data) => {
-        setCards(data);
+        applyCardsResponse(data, 0);
         setLoading(false);
       })
       .catch((err) => {
@@ -3484,9 +3725,16 @@ export default function App() {
   };
 
   // Click handler to select and filter by set name instantly
-  const handleSetClick = (setName: string) => {
+  const handleSetClick = (setName: string, setLanguage = "") => {
     setActiveTab("search");
+    setFilterName("");
     setFilterSetName(setName);
+    setFilterCardNum("");
+    setFilterLang(setLanguage);
+    setFilterRarity("");
+    setFilterRarities([]);
+    setSearchLimit(0);
+    handleSearch(undefined, 0, [], "", setName, setLanguage, "");
   };
 
   // Launch Live Python Process Stream
@@ -4045,7 +4293,12 @@ export default function App() {
                     </button>
                   )}
                   <p className="text-xs text-zinc-400 font-display">
-                    Gefunden: <span className="text-zinc-100 font-bold font-mono">{cards.length}</span> Karten
+                    Gefunden: <span className="text-zinc-100 font-bold font-mono">{searchMeta.total || cards.length}</span> Karten
+                    {(searchMeta.total || 0) > cards.length && (
+                      <span className="ml-1 text-zinc-500">
+                        ({cards.length} angezeigt)
+                      </span>
+                    )}
                   </p>
                   
                   {/* Limit Selection Dropdown */}
@@ -4060,6 +4313,7 @@ export default function App() {
                       }}
                       className="bg-[#18181b] border border-[#27272a] hover:border-[#38383e] text-zinc-300 px-2.5 py-1 rounded-lg text-xs cursor-pointer focus:outline-none focus:border-red-500/30"
                     >
+                      <option value={0}>Alle Treffer</option>
                       <option value={48}>48 Karten</option>
                       <option value={100}>100 Karten</option>
                       <option value={250}>250 Karten</option>
@@ -4067,6 +4321,18 @@ export default function App() {
                       <option value={1000}>1000 Karten</option>
                       <option value={2000}>2000 Karten</option>
                     </select>
+                    {(searchMeta.total || 0) > cards.length && searchLimit !== 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSearchLimit(0);
+                          handleSearch(undefined, 0);
+                        }}
+                        className="bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 text-red-300 px-2.5 py-1 rounded-lg text-[10px] font-bold transition cursor-pointer"
+                      >
+                        Alle laden
+                      </button>
+                    )}
                   </div>
 
                   {/* Sortierfunktion */}
@@ -4741,7 +5007,7 @@ export default function App() {
                           </span>
                           
                           <button 
-                            onClick={() => handleSetClick(set.set_name)}
+                            onClick={() => handleSetClick(set.set_name, set.language || "")}
                             className="text-[11px] text-red-400 hover:text-red-300 font-bold flex items-center gap-0.5 transition cursor-pointer"
                           >
                             Karten anzeigen
@@ -5248,6 +5514,7 @@ export default function App() {
                         setScanImage(null);
                         setScanResult(null);
                         setScanError(null);
+                        setManualScanHint("");
                       }}
                       className="text-[10px] font-mono text-zinc-500 hover:text-red-400 transition cursor-pointer"
                     >
@@ -5325,6 +5592,22 @@ export default function App() {
                   )}
                 </div>
 
+                <div className="space-y-1.5">
+                  <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider font-display">
+                    Set/Nummer als Fallback
+                  </label>
+                  <input
+                    type="text"
+                    value={manualScanHint}
+                    onChange={(e) => setManualScanHint(e.target.value)}
+                    placeholder="z.B. DRI 190/182, sv10 190 oder Meowth 106/094"
+                    className="w-full bg-[#18181b] border border-[#27272a] hover:border-[#38383e] focus:border-red-500/30 focus:outline-none focus:ring-1 focus:ring-red-500/20 rounded-xl px-3.5 py-2 text-xs text-zinc-100 placeholder-zinc-600 transition"
+                  />
+                  <p className="text-[10px] text-zinc-600 leading-relaxed">
+                    Wird mit dem Foto kombiniert, wenn OCR die Fußzeile nicht sicher liest.
+                  </p>
+                </div>
+
                 {scanImage && !isCameraActive && (
                   <button
                     onClick={() => handleScanCardImage(scanImage)}
@@ -5347,6 +5630,27 @@ export default function App() {
                     {scanError}
                   </div>
                 )}
+
+                {scanError && scanResult && (() => {
+                  const debugData = scanResult.raw_scan_results?.[0] || scanResult;
+                  const hints = debugData?.parsed_hints || debugData?.client_hints || {};
+                  const previewText = String(debugData?.client_ocr_text || hints.text || "")
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .slice(0, 220);
+                  return (
+                    <div className="bg-zinc-950 border border-zinc-850 rounded-xl p-3 text-[10px] text-zinc-500 font-mono space-y-1.5">
+                      <div className="flex flex-wrap gap-2">
+                        <span>Set: <span className="text-zinc-300">{Array.isArray(hints.set_codes) && hints.set_codes.length ? hints.set_codes.join(", ") : "keine"}</span></span>
+                        <span>Nr: <span className="text-zinc-300">{Array.isArray(hints.card_numbers) && hints.card_numbers.length ? hints.card_numbers.join(", ") : "keine"}</span></span>
+                        <span>Name: <span className="text-zinc-300">{Array.isArray(hints.names) && hints.names.length ? hints.names.join(", ") : "keiner"}</span></span>
+                      </div>
+                      <div className="text-zinc-600 break-words">
+                        OCR: {previewText || "leer oder nicht geladen"}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {scanResult?.matched_cards?.length > 0 && (
                   <div className="bg-emerald-500/5 border border-emerald-500/15 rounded-xl p-3 flex items-center gap-3">
@@ -6809,6 +7113,7 @@ export default function App() {
         const fmtMarketStat = (value: number) => value > 0
           ? `${value.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`
           : "-";
+        const fmtMarketStatYen = (value: number) => value > 0 ? `~ ${formatYenFromEur(value)}` : "-";
 
         // Dynamic theme customization individually matching the card's element/energy type or character color
         const getCardTheme = () => {
@@ -7210,18 +7515,22 @@ export default function App() {
                         <div className="bg-[#141418]/70 border border-zinc-850 rounded-xl p-2">
                           <span className="block text-zinc-500 uppercase text-[8px]">Lowest</span>
                           <span className="text-zinc-200 font-bold">{fmtMarketStat(marketStats.low)}</span>
+                          <span className="block text-amber-400/80 text-[9px] mt-0.5">{fmtMarketStatYen(marketStats.low)}</span>
                         </div>
                         <div className="bg-[#141418]/70 border border-emerald-500/20 rounded-xl p-2">
                           <span className="block text-emerald-400 uppercase text-[8px]">Median</span>
                           <span className="text-emerald-300 font-bold">{fmtMarketStat(marketStats.median)}</span>
+                          <span className="block text-amber-400/80 text-[9px] mt-0.5">{fmtMarketStatYen(marketStats.median)}</span>
                         </div>
                         <div className="bg-[#141418]/70 border border-zinc-850 rounded-xl p-2">
                           <span className="block text-zinc-500 uppercase text-[8px]">Average</span>
                           <span className="text-zinc-200 font-bold">{fmtMarketStat(marketStats.average)}</span>
+                          <span className="block text-amber-400/80 text-[9px] mt-0.5">{fmtMarketStatYen(marketStats.average)}</span>
                         </div>
                         <div className="bg-[#141418]/70 border border-zinc-850 rounded-xl p-2">
                           <span className="block text-zinc-500 uppercase text-[8px]">Max</span>
                           <span className="text-zinc-200 font-bold">{fmtMarketStat(marketStats.max)}</span>
+                          <span className="block text-amber-400/80 text-[9px] mt-0.5">{fmtMarketStatYen(marketStats.max)}</span>
                         </div>
                       </div>
                     </div>
