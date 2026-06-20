@@ -1372,6 +1372,7 @@ async function bootstrapDatabase(skipOnePieceSeed = false) {
     // Seed One Piece TCG data
     if (!skipOnePieceSeed) {
       await seedOnePieceData();
+      await ensureCustomOnePiecePromoCards();
     } else {
       console.log("[Bootstrap] Skipping automatic seeding of One Piece data due to requested clean db reset.");
     }
@@ -2510,6 +2511,102 @@ async function seedOnePieceData(force = false) {
   }
 }
 
+async function ensureCustomOnePiecePromoCards() {
+  const now = new Date().toISOString();
+  try {
+    const setName = "BVB x ONE PIECE DAY Matchday Promo";
+    const setCode = "BVB";
+    const releaseDate = "2025-04-05";
+    const imageUrl = "https://images.snkrdunk.com/en/magazine/wp-content/uploads/2025/03/ONE-PIECE-Card-Game-Monkey-D.Luffy-The-Three-Brothers-ST-13-ST13-003-Release-Date-Price-Where-To-Buy_5c4e21ac-1200x675.webp";
+
+    await dbRun(`
+      INSERT INTO sets (
+        set_name, set_code, series, language, release_date, total_cards, logo, symbol,
+        english_set_name, german_set_name, created_at, updated_at, game
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'onepiece')
+      ON CONFLICT(set_code, language) DO UPDATE SET
+        set_name = excluded.set_name,
+        series = excluded.series,
+        release_date = excluded.release_date,
+        total_cards = excluded.total_cards,
+        logo = excluded.logo,
+        symbol = excluded.symbol,
+        english_set_name = excluded.english_set_name,
+        german_set_name = excluded.german_set_name,
+        updated_at = excluded.updated_at,
+        game = 'onepiece'
+    `, [
+      setName,
+      setCode,
+      "PROMO",
+      "EN",
+      releaseDate,
+      1,
+      "",
+      setCode,
+      setName,
+      "BVB x ONE PIECE DAY Spieltags-Promo",
+      now,
+      now
+    ]);
+
+    await dbRun(`
+      INSERT INTO cards (
+        api_card_id, english_name, local_name, pokemon_name, japanese_name, language,
+        set_name, set_code, card_number, rarity, supertype, subtype, hp, types,
+        evolves_from, regulation_mark, illustrator, release_date, image_small, image_large,
+        cardmarket_id, created_at, updated_at, game
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'onepiece')
+      ON CONFLICT(api_card_id, language) DO UPDATE SET
+        english_name = excluded.english_name,
+        local_name = excluded.local_name,
+        pokemon_name = excluded.pokemon_name,
+        set_name = excluded.set_name,
+        set_code = excluded.set_code,
+        card_number = excluded.card_number,
+        rarity = excluded.rarity,
+        supertype = excluded.supertype,
+        subtype = excluded.subtype,
+        hp = excluded.hp,
+        types = excluded.types,
+        release_date = excluded.release_date,
+        image_small = excluded.image_small,
+        image_large = excluded.image_large,
+        cardmarket_id = excluded.cardmarket_id,
+        updated_at = excluded.updated_at,
+        game = 'onepiece'
+    `, [
+      "bvb-luffy-promo-en",
+      "Monkey.D.Luffy (BVB x ONE PIECE Promo)",
+      "Monkey.D.Luffy (BVB x ONE PIECE Promo)",
+      "Monkey.D.Luffy ST13-003 BVB x ONE PIECE Promo",
+      "",
+      "EN",
+      setName,
+      setCode,
+      "ST13-003",
+      "Leader",
+      "LEADER",
+      "Supernovas/Straw Hat Crew",
+      5000,
+      "Black/Yellow",
+      "",
+      "",
+      "",
+      releaseDate,
+      imageUrl,
+      imageUrl,
+      "",
+      now,
+      now
+    ]);
+  } catch (err) {
+    console.warn("[CustomOnePieceSeed] Failed to ensure custom One Piece promo cards:", err);
+  }
+}
+
 function runOnePieceOfficialImport(limit = "0") {
   return new Promise<void>((resolve, reject) => {
     const args = ["onepiece_importer.py", "import", "--sets-count", limit];
@@ -2547,6 +2644,7 @@ const buildOnePieceSearchNumber = (setCode: any, cardNum: any, apiCardId: any = 
   const code = stripJapaneseChars(setCode).toUpperCase().replace(/\s+/g, "");
   const existingFull = rawCardNum || rawApiId;
   if (/^(OP|ST|EB|PRB|P)-?\d+/i.test(existingFull)) return existingFull.toUpperCase();
+  if (/^[A-Z0-9]{2,}-[A-Z0-9]+$/i.test(existingFull)) return existingFull.toUpperCase();
   if (code && /^\d{1,3}$/.test(existingFull)) return `${code}-${existingFull.padStart(3, "0")}`;
   if (code && existingFull) return `${code}-${existingFull}`.toUpperCase();
   return existingFull.toUpperCase();
@@ -2898,6 +2996,72 @@ const POKEMON_OFFICIAL_TOTAL_TO_SET_CODES: Record<string, string[]> = {
 
 const MARKET_PRICE_FRESH_DAYS = 14;
 const MARKET_PRICE_STALE_DAYS = 45;
+
+function parseOnePieceCombinedSearch(value: any) {
+  const raw = String(value || "").trim();
+  const lower = raw.toLowerCase();
+  const tokens = (raw.match(/[A-Za-z0-9]+/g) || []).map(token => token.trim()).filter(Boolean);
+  const setCodes = new Set<string>();
+  const cardNumberPrefixes = new Set<string>();
+  const cardNumbers = new Set<string>();
+  const hasPromoTerm = /\b(?:promo|promos|limited|product)\b/.test(lower);
+
+  for (const token of tokens) {
+    const upper = token.toUpperCase();
+    if (/^(OP|ST|EB|PR)\d{1,2}$/.test(upper)) {
+      setCodes.add(upper);
+      cardNumberPrefixes.add(`${upper}-`);
+    }
+  }
+
+  const compact = lower.replace(/[^a-z0-9]+/g, "");
+  const isBvbPromo = /\b(?:bvb|bvb09|borussia|dortmund)\b/.test(lower);
+  const isThreeBrothersBond =
+    /\bbnb\b/.test(lower)
+    || compact.includes("brothersbond")
+    || compact.includes("threebrothers")
+    || compact.includes("3brothers");
+  if (isThreeBrothersBond) {
+    setCodes.add("ST13");
+    cardNumberPrefixes.add("ST13-");
+  }
+
+  if (isBvbPromo) {
+    setCodes.clear();
+    cardNumberPrefixes.clear();
+    setCodes.add("BVB");
+    cardNumbers.add("ST13-003");
+  }
+
+  if (hasPromoTerm && !isBvbPromo) {
+    setCodes.clear();
+    setCodes.add("PR");
+  }
+
+  if (isThreeBrothersBond) {
+    if (/\bluffy\b|\bruffy\b/.test(lower)) cardNumbers.add("ST13-003");
+    if (/\bace\b/.test(lower)) cardNumbers.add("ST13-002");
+    if (/\bsabo\b/.test(lower)) cardNumbers.add("ST13-001");
+  }
+
+  const ignoredTerms = new Set([
+    "one", "piece", "tcg", "card", "cards",
+    "bnb", "bvb", "bvb09", "borussia", "dortmund", "bond", "bonds", "brother", "brothers", "three", "3", "the",
+    "promo", "promos", "limited", "product"
+  ]);
+  const nameTerms = tokens
+    .map(token => token.toLowerCase())
+    .filter(token => token.length >= 2)
+    .filter(token => !ignoredTerms.has(token))
+    .filter(token => !/^(op|st|eb|pr)\d{1,2}$/i.test(token));
+
+  return {
+    set_codes: Array.from(setCodes),
+    name_terms: Array.from(new Set(nameTerms)),
+    card_number_prefixes: Array.from(cardNumberPrefixes),
+    card_numbers: Array.from(cardNumbers)
+  };
+}
 
 function normalizeMarketSource(source: any): string {
   return String(source || "manual").trim().toLowerCase().replace(/\s+/g, "_");
@@ -3259,6 +3423,7 @@ app.get("/api/cards", async (req, res) => {
         console.log("[Auto-Seed] No One Piece cards found in get-cards. Legacy fallback seed is disabled; run the official One Piece importer.");
         await seedOnePieceData(true);
       }
+      await ensureCustomOnePiecePromoCards();
     }
 
     if (Object.keys(setTranslationCache).length === 0) {
@@ -3271,6 +3436,9 @@ app.get("/api/cards", async (req, res) => {
     if (english_name || local_name) {
       const searchValPlain = String(english_name || local_name).trim();
       const searchLikeValue = `%${searchValPlain}%`;
+      const onePieceCombined = game === "onepiece"
+        ? parseOnePieceCombinedSearch(searchValPlain)
+        : { set_codes: [], name_terms: [], card_number_prefixes: [], card_numbers: [] };
 
       let matchingSpecies: any[] = [];
       if (game === "pokemon") {
@@ -3288,7 +3456,26 @@ app.get("/api/cards", async (req, res) => {
         }
       }
 
-      if (matchingSpecies.length > 0) {
+      if (game === "onepiece" && onePieceCombined.set_codes.length > 0) {
+        query += ` AND UPPER(set_code) IN (${onePieceCombined.set_codes.map(() => "?").join(",")})`;
+        params.push(...onePieceCombined.set_codes);
+
+        if (onePieceCombined.card_number_prefixes.length > 0) {
+          query += ` AND (${onePieceCombined.card_number_prefixes.map(() => "UPPER(card_number) LIKE ?").join(" OR ")})`;
+          params.push(...onePieceCombined.card_number_prefixes.map((prefix: string) => `${prefix.toUpperCase()}%`));
+        }
+
+        if (onePieceCombined.card_numbers.length > 0) {
+          query += ` AND UPPER(card_number) IN (${onePieceCombined.card_numbers.map(() => "?").join(",")})`;
+          params.push(...onePieceCombined.card_numbers.map((num: string) => num.toUpperCase()));
+        }
+
+        for (const term of onePieceCombined.name_terms) {
+          const termLike = `%${term}%`;
+          query += " AND (LOWER(english_name) LIKE ? OR LOWER(local_name) LIKE ? OR LOWER(pokemon_name) LIKE ? OR LOWER(japanese_name) LIKE ? OR LOWER(card_number) LIKE ?)";
+          params.push(termLike, termLike, termLike, termLike, termLike);
+        }
+      } else if (matchingSpecies.length > 0) {
         // We found a matching species! Clean, unique list of all translated names for matching species
         const allNamesSet = new Set<string>();
         allNamesSet.add(searchValPlain);
